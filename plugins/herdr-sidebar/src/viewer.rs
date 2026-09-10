@@ -1814,6 +1814,11 @@ fn spawn_preview_tab(
         cleanup_moved_spawn(&new_pane, &tab_id, &control);
         return Err("preview process failed to start".into());
     }
+    // Do not rely on `pane.move`'s focus flag: it leaves focus on the
+    // origin tab on some herdr versions, which reads as "first click does
+    // nothing" (later clicks work because the reuse paths focus
+    // explicitly). Focusing an already-focused tab is a no-op.
+    let _ = ipc::call_text("tab.focus", serde_json::json!({ "tab_id": tab_id }));
     Ok(PreviewTarget {
         pane_id: new_pane,
         tab_id,

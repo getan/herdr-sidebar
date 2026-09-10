@@ -37,9 +37,30 @@ fn generate(diff: &str, files: &[String]) -> String {
     }
 }
 
-/// One subject line from the `claude` CLI, or `None` on any failure. Candidate
-/// program names cover the native install (`claude`/`claude.exe`, found by
-/// CreateProcess) and the npm shim (`claude.cmd`, which CreateProcess skips).
+fn suggest_program() -> String {
+    std::env::var("HERDR_SIDEBAR_SUGGEST_PROGRAM")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "codex".to_string())
+}
+
+fn suggest_model(program: &str) -> String {
+    if let Ok(m) = std::env::var("HERDR_SIDEBAR_SUGGEST_MODEL") {
+        if !m.trim().is_empty() {
+            return m;
+        }
+    }
+    if program.contains("codex") {
+        "gpt-5-mini".to_string()
+    } else {
+        "haiku".to_string()
+    }
+}
+
+/// One subject line from the configured CLI, or `None` on any failure.
+/// Default is `codex` (via `codex exec`), fallback to `claude` shim is
+/// kept for backwards compat. Program/model are overridable via
+/// `HERDR_SIDEBAR_SUGGEST_PROGRAM` / `HERDR_SIDEBAR_SUGGEST_MODEL`.
 fn ask_claude(diff: &str) -> Option<String> {
     let mut input = String::with_capacity(diff.len().min(MAX_DIFF_BYTES));
     for c in diff.chars() {
@@ -50,28 +71,77 @@ fn ask_claude(diff: &str) -> Option<String> {
         input.push(c);
     }
 
-    #[cfg(windows)]
-    let candidates = ["claude", "claude.cmd"];
-    #[cfg(not(windows))]
-    let candidates = ["claude"];
+    let program = suggest_program();
+    let model = suggest_model(&program);
+    let is_codex = program.contains("codex");
 
-    for program in candidates {
-        let spawned = std::process::Command::new(program)
-            .args(["-p", "--model", "haiku", "--strict-mcp-config", PROMPT])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        let Ok(mut child) = spawned else { continue };
-        if let Some(stdin) = child.stdin.take() {
-            let mut stdin = stdin;
-            if stdin.write_all(input.as_bytes()).is_err() {
-                let _ = child.kill();
-                continue;
+    #[cfg(windows)]
+    let claude_candidates = ["claude", "claude.cmd"];
+    #[cfg(not(windows))]
+    let claude_candidates: &[&str] = &["claude"];
+
+    let candidates: Vec<String> = if is_codex {
+        vec![program.clone()]
+    } else if program != "claude" {
+        vec![program.clone()]
+    } else {
+        claude_candidates.iter().map(|s| s.to_string()).collect()
+    };
+
+    for prog in candidates {
+        let spawn_res = if prog.contains("codex") {
+            let prompt = format!("{PROMPT}\n\nDiff:\n{input}");
+            std::process::Command::new(&prog)
+                .args(["exec", "-m", &model, "--color", "never", &prompt])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        } else {
+            std::process::Command::new(&prog)
+                .args(["-p", "--model", &model, "--strict-mcp-config", PROMPT])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        };
+        let Ok(mut child) = spawn_res else { continue };
+        if !prog.contains("codex") {
+            if let Some(stdin) = child.stdin.take() {
+                let mut stdin = stdin;
+                if stdin.write_all(input.as_bytes()).is_err() {
+                    let _ = child.kill();
+                    continue;
+                }
             }
-            // Dropping stdin closes it so claude sees EOF.
         }
-        return wait_with_timeout(child);
+        if let Some(msg) = wait_with_timeout(child) {
+            return Some(msg);
+        }
+        if is_codex {
+            continue;
+        }
+    }
+    // codex failed → try claude as fallback
+    if is_codex {
+        for prog in claude_candidates {
+            let Ok(mut child) = std::process::Command::new(prog)
+                .args(["-p", "--model", "haiku", "--strict-mcp-config", PROMPT])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn() else { continue };
+            if let Some(stdin) = child.stdin.take() {
+                let mut stdin = stdin;
+                if stdin.write_all(input.as_bytes()).is_err() {
+                    let _ = child.kill();
+                    continue;
+                }
+            }
+            if let Some(msg) = wait_with_timeout(child) {
+                return Some(msg);
+            }
+        }
     }
     None
 }

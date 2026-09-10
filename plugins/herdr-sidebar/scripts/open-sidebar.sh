@@ -25,7 +25,7 @@ bin="$bin_dir/herdr-sidebar"
 if [ ! -x "$bin" ]; then
   exec "$herdr_bin" plugin pane open \
     --plugin herdr-sidebar \
-    --entrypoint filetree \
+    --entrypoint sidebar \
     --placement split \
     --direction right \
     --focus
@@ -60,7 +60,7 @@ open_pane() {
   fcwd="${fp#*	}"
   if [ -z "$fid" ]; then
     "$herdr_bin" plugin pane open --plugin herdr-sidebar \
-      --entrypoint filetree --placement split --direction right --focus
+      --entrypoint sidebar --placement split --direction right --focus
   fi
 
   target="$fid"

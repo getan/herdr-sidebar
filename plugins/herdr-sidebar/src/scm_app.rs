@@ -595,6 +595,8 @@ pub struct App {
     pane_ctl: Option<PaneCtl>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
+    collapsed: bool,
+    expanded_width: u16,
     /// A native folder picker running on a background thread; its result
     /// arrives here (None = cancelled).
     picking: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
@@ -701,6 +703,8 @@ impl App {
             other_exe,
             pane_ctl,
             last_beat: std::time::Instant::now(),
+            collapsed: false,
+            expanded_width: sidebar_state.sidebar_width,
             picking: None,
             cwd_follower,
             persisted_draft_roots,
@@ -762,16 +766,21 @@ impl App {
     /// Hide the sidebar: snooze this tab (so the quiet ensure hook doesn't
     /// immediately re-dock a fresh one) and close our own pane. The herdr
     /// prefix+b keybinding (→ the toggle action) brings it back.
+    const COLLAPSED_WIDTH: u16 = 4;
+    fn collapse(&mut self) {
+        if self.collapsed { return; }
+        self.expanded_width = self.last_width.max(20);
+        self.collapsed = true;
+        if let Some(ctl) = &self.pane_ctl { ctl.resize_to(self.last_width, Self::COLLAPSED_WIDTH, self.sidebar_state.dock_right); }
+    }
+    fn restore(&mut self) {
+        if !self.collapsed { return; }
+        self.collapsed = false;
+        let target = self.expanded_width.clamp(24, 80);
+        if let Some(ctl) = &self.pane_ctl { ctl.resize_to(self.last_width, target, self.sidebar_state.dock_right); }
+    }
     fn hide(&mut self) {
-        let Some(ctl) = &self.pane_ctl else { return };
-        if let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) {
-            let tab = herdr_sidebar::launch::tab_of(&json, &ctl.pane_id);
-            herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab);
-        }
-        let _ = herdr_sidebar::ipc::call_text(
-            "pane.close",
-            serde_json::json!({ "pane_id": ctl.pane_id }),
-        );
+        if self.collapsed { self.restore(); } else { self.collapse(); }
     }
 
     /// Re-read every repo's git status (this is the change auto-detection —
@@ -1221,6 +1230,13 @@ impl App {
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
+        if self.collapsed {
+            if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
+                let h = self.last_height.max(1);
+                if mouse.row + 1 >= h { self.restore(); }
+            }
+            return None;
+        }
         // Any mouse activity = "the mouse is over this pane": it shows the
         // hover title-bar buttons until the linger expires.
         self.last_mouse = Some(std::time::Instant::now());
@@ -2844,6 +2860,27 @@ impl App {
     // ---- Rendering ----
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        if self.collapsed {
+            let area = frame.area();
+            self.last_width = area.width;
+            self.last_height = area.height;
+            frame.render_widget(Clear, area);
+            let cx = area.x;
+            let w = area.width;
+            let is_exp = self.sidebar_state.active == View::Explorer;
+            let e_line = if is_exp { ratatui::text::Line::from(vec!["1 ".dim(), "●".green()]) } else { ratatui::text::Line::from(vec!["1 ".dim(), "○".dim()]) };
+            let s_line = if !is_exp { ratatui::text::Line::from(vec!["2 ".dim(), "●".green()]) } else { ratatui::text::Line::from(vec!["2 ".dim(), "○".dim()]) };
+            if area.height > 2 {
+                frame.render_widget(ratatui::widgets::Paragraph::new(e_line).alignment(ratatui::layout::Alignment::Center), ratatui::layout::Rect{ x: cx, y: area.y+1, width: w, height: 1});
+                frame.render_widget(ratatui::widgets::Paragraph::new(s_line).alignment(ratatui::layout::Alignment::Center), ratatui::layout::Rect{ x: cx, y: area.y+2, width: w, height: 1});
+            }
+            if area.height > 1 {
+                let by = area.y + area.height.saturating_sub(1);
+                let restore = ratatui::text::Line::from(vec![">>".cyan().bold()]);
+                frame.render_widget(ratatui::widgets::Paragraph::new(restore).alignment(ratatui::layout::Alignment::Center), ratatui::layout::Rect{ x: cx, y: by, width: w, height: 1});
+            }
+            return;
+        }
         let area = frame.area();
         self.last_width = area.width;
         self.last_height = area.height;

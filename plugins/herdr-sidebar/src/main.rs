@@ -279,6 +279,11 @@ fn run_explorer(
                 Event::Key(key) => app.on_key(key),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
                 Event::Resize(width, _) => {
+                    // Tab switches resize panes transiently; ratatui's
+                    // differential rendering can leave a torn frame (narrow
+                    // truncation baked in) that persists until the next
+                    // content change. Force a full repaint instead.
+                    let _ = terminal.clear();
                     app.on_resize(width);
                     None
                 }
@@ -323,6 +328,11 @@ fn run_scm(
                 Event::Key(key) => app.on_key(key),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
                 Event::Resize(width, _) => {
+                    // Tab switches resize panes transiently; ratatui's
+                    // differential rendering can leave a torn frame (narrow
+                    // truncation baked in) that persists until the next
+                    // content change. Force a full repaint instead.
+                    let _ = terminal.clear();
                     app.on_resize(width);
                     None
                 }

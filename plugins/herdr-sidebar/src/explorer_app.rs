@@ -292,6 +292,8 @@ pub struct App {
     deco_rx: Option<std::sync::mpsc::Receiver<Decorations>>,
     quick_index: Option<QuickIndex>,
     quick_index_rx: Option<std::sync::mpsc::Receiver<QuickIndex>>,
+    collapsed: bool,
+    expanded_width: u16,
 }
 
 /// How long two clicks on the same row still count as a double click.
@@ -385,6 +387,8 @@ impl App {
             deco_rx: None,
             quick_index: None,
             quick_index_rx: None,
+            collapsed: false,
+            expanded_width: sidebar_state.sidebar_width,
         };
         app.apply_identity();
         app.request_decorations(true);
@@ -608,19 +612,33 @@ impl App {
         }
     }
 
-    /// Hide the sidebar: snooze this tab (so the quiet ensure hook doesn't
-    /// immediately re-dock a fresh one) and close our own pane. The herdr
-    /// prefix+b keybinding (→ the toggle action) brings it back.
-    fn hide(&mut self) {
-        let Some(ctl) = &self.pane_ctl else { return };
-        if let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) {
-            let tab = herdr_sidebar::launch::tab_of(&json, &ctl.pane_id);
-            herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab);
+    const COLLAPSED_WIDTH: u16 = 4;
+    fn collapse(&mut self) {
+        if self.collapsed { return; }
+        self.expanded_width = self.last_width.max(20);
+        self.collapsed = true;
+        if let Some(ctl) = &self.pane_ctl {
+            ctl.resize_to(self.last_width, Self::COLLAPSED_WIDTH, self.sidebar_state.dock_right);
         }
-        let _ = herdr_sidebar::ipc::call_text(
-            "pane.close",
-            serde_json::json!({ "pane_id": ctl.pane_id }),
-        );
+    }
+    fn restore(&mut self) {
+        if !self.collapsed { return; }
+        self.collapsed = false;
+        let target = self.expanded_width.clamp(24, 80);
+        if let Some(ctl) = &self.pane_ctl {
+            ctl.resize_to(self.last_width, target, self.sidebar_state.dock_right);
+        }
+    }
+    /// Hide the sidebar: collapse to a narrow bar at the original dock edge
+    /// with a clickable restore affordance. A second `b` or a click restores.
+    /// This keeps the pane alive at its dock position, like herdr's native
+    /// collapsed sidebar, instead of fully closing it.
+    fn hide(&mut self) {
+        if self.collapsed {
+            self.restore();
+        } else {
+            self.collapse();
+        }
     }
 
     // ---- Unified-sidebar operations ----
@@ -776,6 +794,15 @@ impl App {
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
+        if self.collapsed {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let h = self.last_height.max(1);
+                if mouse.row + 1 >= h {
+                    self.restore();
+                }
+            }
+            return None;
+        }
         // Any mouse activity = "the mouse is over this pane": it shows the
         // hover title-bar buttons until the linger expires.
         self.last_mouse = Some(std::time::Instant::now());
@@ -1971,6 +1998,25 @@ impl App {
     pub fn draw(&mut self, frame: &mut Frame) {
         self.last_width = frame.area().width;
         self.last_height = frame.area().height;
+        if self.collapsed {
+            let area = frame.area();
+            frame.render_widget(Clear, area);
+            let cx = area.x;
+            let w = area.width;
+            let is_exp = self.sidebar_state.active == View::Explorer;
+            let e_line = if is_exp { Line::from(vec!["1 ".dim(), "●".green()]) } else { Line::from(vec!["1 ".dim(), "○".dim()]) };
+            let s_line = if !is_exp { Line::from(vec!["2 ".dim(), "●".green()]) } else { Line::from(vec!["2 ".dim(), "○".dim()]) };
+            if area.height > 2 {
+                frame.render_widget(Paragraph::new(e_line).alignment(Alignment::Center), Rect{ x: cx, y: area.y+1, width: w, height: 1 });
+                frame.render_widget(Paragraph::new(s_line).alignment(Alignment::Center), Rect{ x: cx, y: area.y+2, width: w, height: 1 });
+            }
+            if area.height > 1 {
+                let by = area.y + area.height.saturating_sub(1);
+                let restore = Line::from(vec![">>".cyan().bold()]);
+                frame.render_widget(Paragraph::new(restore).alignment(Alignment::Center), Rect{ x: cx, y: by, width: w, height: 1 });
+            }
+            return;
+        }
         // No own border/title: herdr already frames the pane and titles it with
         // the pane label ("Explorer"/"Sidebar") — a second border read as a
         // double frame.
