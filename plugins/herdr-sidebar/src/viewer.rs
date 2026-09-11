@@ -1280,6 +1280,40 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                             );
                                         }
                                     }
+                                    KeyCode::Char('E') => {
+                                        if let Some(Request::File(path)) = current.as_ref() {
+                                            match external_editor() {
+                                                Some((program, args)) => {
+                                                    match run_external_editor(
+                                                        &mut terminal, &program, &args, path,
+                                                    ) {
+                                                        Ok(true) => {
+                                                            if let Some(req @ Request::File(_)) =
+                                                                current.clone()
+                                                            {
+                                                                *doc = load(&req);
+                                                            }
+                                                            notice = None;
+                                                        }
+                                                        _ => {
+                                                            notice = Some(format!(
+                                                                "editor failed: {program}"
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                                None => {
+                                                    notice = Some(
+                                                        "no editor found (set $EDITOR)".into(),
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            notice = Some(
+                                                "diffs and history previews are read-only".into(),
+                                            );
+                                        }
+                                    }
                                     KeyCode::Up | KeyCode::Char('k') => {
                                         doc.scroll = doc.scroll.saturating_sub(1)
                                     }
@@ -1541,7 +1575,7 @@ fn draw_doc(
     let hint = if let Some(notice) = notice {
         format!(" {notice}")
     } else if editable {
-        format!(" drag select  Ctrl/Cmd+C copy  e edit  {wrap_hint}  q close")
+        format!(" drag select  Ctrl/Cmd+C copy  e edit  E editor  {wrap_hint}  q close")
     } else {
         format!(" drag select  Ctrl/Cmd+C copy  ↑↓ scroll  {wrap_hint}  q close")
     };
@@ -1706,6 +1740,69 @@ pub fn open_in_pane(
     } else {
         spawn_preview_tab(my_pane_id, spawn_cwd, doc_key, payload, &origin_tab_id)
     }
+}
+
+/// Split an editor command into program plus leading args (`"code --wait"`
+/// becomes `("code", ["--wait"])`). The file path is appended by the caller
+/// and never passes through a shell.
+fn split_editor_cmd(cmd: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = cmd.split_whitespace().map(str::to_string);
+    parts
+        .next()
+        .filter(|program| !program.is_empty())
+        .map(|program| (program, parts.collect()))
+}
+
+/// External-editor resolution for the preview pane's `E` key, in precedence
+/// order: `$HERDR_SIDEBAR_EDITOR`, `$EDITOR`, the persisted `editor_cmd`,
+/// then `nvim`. Returns `None` only when the resolved program fails its
+/// `--version` probe.
+fn external_editor() -> Option<(String, Vec<String>)> {
+    let state_cmd = crate::state::load_state().editor_cmd;
+    let candidates = [
+        std::env::var("HERDR_SIDEBAR_EDITOR").ok(),
+        std::env::var("EDITOR").ok(),
+        Some(state_cmd),
+        Some("nvim".to_string()),
+    ];
+    let (program, args) = candidates
+        .iter()
+        .filter_map(|candidate| candidate.as_deref())
+        .find_map(split_editor_cmd)?;
+    std::process::Command::new(&program)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.success())
+        .then_some((program, args))
+}
+
+/// Suspend the TUI, run an external editor on `path` with the pane's own
+/// tty, then resume. Returns whether the editor exited successfully.
+fn run_external_editor(
+    terminal: &mut ratatui::DefaultTerminal,
+    program: &str,
+    args: &[String],
+    path: &std::path::Path,
+) -> std::io::Result<bool> {
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture
+    );
+    ratatui::restore();
+    let status = std::process::Command::new(program)
+        .args(args)
+        .arg(path)
+        .status();
+    *terminal = ratatui::init();
+    crossterm::style::force_color_output(true);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture
+    );
+    let _ = terminal.clear();
+    status.map(|status| status.success())
 }
 
 /// Where a preview request landed. Handed back so a double click can pin
@@ -2483,6 +2580,20 @@ mod tests {
         rows.iter()
             .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn editor_cmd_splitting_skips_empty_sources() {
+        assert_eq!(split_editor_cmd(""), None);
+        assert_eq!(split_editor_cmd("   "), None);
+        assert_eq!(
+            split_editor_cmd("nvim"),
+            Some(("nvim".to_string(), vec![]))
+        );
+        assert_eq!(
+            split_editor_cmd("code --wait --new-window"),
+            Some(("code".to_string(), vec!["--wait".to_string(), "--new-window".to_string()]))
+        );
     }
 
     #[test]

@@ -225,7 +225,7 @@ impl PreviewPlacement {
 }
 
 /// The sticky sidebar setting, shared by both plugins.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct State {
     pub merged: bool,
     pub active: View,
@@ -271,6 +271,10 @@ pub struct State {
     /// Whether a clicked file opens in its own tab or in a viewer pane beside
     /// the sidebar, inside the tab the click came from.
     pub preview_placement: PreviewPlacement,
+    /// External editor for the preview pane's `E` key: program plus optional
+    /// args (`"nvim"`, `"code --wait"`). `$EDITOR` and `$HERDR_SIDEBAR_EDITOR`
+    /// take precedence at resolve time. The built-in `e` editor stays as-is.
+    pub editor_cmd: String,
 }
 
 impl Default for State {
@@ -290,6 +294,7 @@ impl Default for State {
             dock_right: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             preview_placement: PreviewPlacement::Tab,
+            editor_cmd: "nvim".to_string(),
         }
     }
 }
@@ -378,7 +383,7 @@ pub fn load_state() -> State {
     // One-time migration from the legacy config-dir file.
     if let Some(json) = legacy_state_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         let state = parse_state(&json);
-        save_state(state);
+        save_state(state.clone());
         return state;
     }
     State::default()
@@ -416,17 +421,21 @@ pub fn update_state(update: impl FnOnce(&mut State)) -> State {
         state = parse_state(&json);
     }
     update(&mut state);
-    write_state(&path, state);
+    write_state(&path, state.clone());
     state
 }
+
+/// Longest `editor_cmd` kept from disk.
+const MAX_EDITOR_CMD_LEN: usize = 256;
 
 fn write_state(path: &Path, state: State) {
     let icons = match state.icons {
         Some(theme) => format!(",\"icons\":\"{}\"", theme.state_name()),
         None => String::new(),
     };
+    let editor_json = serde_json::to_string(&state.editor_cmd).unwrap_or_default();
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\"{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"editor_cmd\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.show_hotkeys,
@@ -439,7 +448,8 @@ fn write_state(path: &Path, state: State) {
         state.dock_right,
         clamp_sidebar_width(state.sidebar_width),
         state.color_theme.label(),
-        state.preview_placement.label()
+        state.preview_placement.label(),
+        editor_json
     );
     let _ = std::fs::write(path, json);
 }
@@ -875,6 +885,11 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| v.as_str())
             .and_then(PreviewPlacement::from_state_name)
             .unwrap_or(default.preview_placement),
+        editor_cmd: value
+            .get("editor_cmd")
+            .and_then(|v| v.as_str())
+            .map(|s| s.chars().take(MAX_EDITOR_CMD_LEN).collect())
+            .unwrap_or_else(|| default.editor_cmd.clone()),
     }
 }
 
@@ -1015,8 +1030,9 @@ mod tests {
             dock_right: true,
             sidebar_width: 44,
             preview_placement: PreviewPlacement::Pane,
+            editor_cmd: "nvim".to_string(),
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"editor_cmd\":\"nvim\",\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git

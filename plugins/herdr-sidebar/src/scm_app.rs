@@ -635,6 +635,7 @@ impl App {
         // The other view ships in this same binary — always available.
         let other_exe = std::env::current_exe().ok();
         let sidebar_state = sidebar::load_state();
+        let sidebar_width = sidebar_state.sidebar_width;
         set_color_theme(sidebar_state.color_theme);
         let pane_ctl = PaneCtl::from_env();
         let last_layout_width = pane_ctl.as_ref().and_then(PaneCtl::layout_width);
@@ -704,7 +705,7 @@ impl App {
             pane_ctl,
             last_beat: std::time::Instant::now(),
             collapsed: false,
-            expanded_width: sidebar_state.sidebar_width,
+            expanded_width: sidebar_width,
             picking: None,
             cwd_follower,
             persisted_draft_roots,

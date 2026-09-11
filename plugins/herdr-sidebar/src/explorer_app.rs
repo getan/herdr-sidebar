@@ -346,6 +346,7 @@ impl App {
         // The other view ships in this same binary — always available.
         let other_exe = std::env::current_exe().ok();
         let sidebar_state = sidebar::load_state();
+        let sidebar_width = sidebar_state.sidebar_width;
         set_color_theme(sidebar_state.color_theme);
         let repos = if sidebar_state.git_deco {
             Git::discover_all(&tree.root_path())
@@ -388,7 +389,7 @@ impl App {
             quick_index: None,
             quick_index_rx: None,
             collapsed: false,
-            expanded_width: sidebar_state.sidebar_width,
+            expanded_width: sidebar_width,
         };
         app.apply_identity();
         app.request_decorations(true);
