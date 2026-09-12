@@ -19,8 +19,10 @@ use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use herdr_sidebar::{launch, state, viewer};
 use state::{Exit, View};
 
-/// How often the source-control view re-reads `git status` while idle.
-const REFRESH_EVERY: Duration = Duration::from_millis(1500);
+/// Tick cadence for the source-control view. Cheap by design: each tick only
+/// drains OS file events and collects finished background `git status` runs —
+/// heavy git work never runs on the UI thread, so this can stay snappy.
+const REFRESH_EVERY: Duration = Duration::from_millis(500);
 
 fn main() -> std::io::Result<()> {
     let mode = std::env::args().nth(1);

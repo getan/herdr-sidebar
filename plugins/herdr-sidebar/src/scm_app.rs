@@ -34,6 +34,7 @@ use herdr_sidebar::ui::{
     title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
     wrap_footer_message, wrap_hints,
 };
+use herdr_sidebar::watch::WorkdirWatcher;
 
 /// How many log lines the history-ish drawers fetch.
 const DRAWER_LIMIT: usize = 30;
@@ -41,6 +42,16 @@ const DRAWER_LIMIT: usize = 30;
 /// How long two clicks on the same row still count as a double click (to pin
 /// a diff/show tab), matching the file explorer.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
+
+/// File-event debounce while the pane is focused: snappy, yet a save burst
+/// still coalesces into one background `git status`.
+const WATCH_DEBOUNCE_FOCUSED: std::time::Duration = std::time::Duration::from_millis(400);
+/// Same while unfocused: the view still refreshes (it may be visible),
+/// just less eagerly.
+const WATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+/// `pane.list` focus probes are throttled to this; the watcher itself needs
+/// no focus state to collect events.
+const FOCUS_PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {
@@ -565,6 +576,17 @@ pub struct App {
     suggesting: Option<Receiver<String>>,
     /// Pending Sync Changes run, polled from tick().
     syncing: Option<Receiver<Result<String, String>>>,
+    /// Passive refresh: OS file events mark repos dirty; the heavy
+    /// `git status` then runs on a background thread (`status_rx`).
+    watcher: WorkdirWatcher,
+    /// In-flight background status run, collected from tick().
+    status_rx: Option<Receiver<Vec<(PathBuf, Result<Status, String>)>>>,
+    /// A debounced status run is waiting for its quiet period.
+    status_pending: bool,
+    /// Throttled focus probe: a false->true edge forces one refresh so
+    /// events lost while unfocused can never leave a stale view.
+    was_focused: bool,
+    last_focus_probe: std::time::Instant,
     overlay: Option<Overlay>,
     hovered: Option<usize>,
     body: BodyGeom,
@@ -687,6 +709,11 @@ impl App {
             flash: None,
             suggesting: None,
             syncing: None,
+            watcher: WorkdirWatcher::new(),
+            status_rx: None,
+            status_pending: false,
+            was_focused: true,
+            last_focus_probe: std::time::Instant::now(),
             overlay: None,
             hovered: None,
             body: BodyGeom::default(),
@@ -712,6 +739,7 @@ impl App {
         };
         app.apply_identity();
         app.refresh();
+        app.sync_watches();
         // Rows are built now: re-find the selected row by its stable id and
         // restore the scroll the user left it on.
         if let Some(id) = selected_id
@@ -784,9 +812,11 @@ impl App {
         if self.collapsed { self.restore(); } else { self.collapse(); }
     }
 
-    /// Re-read every repo's git status (this is the change auto-detection —
-    /// tick() calls it every [`crate::REFRESH_EVERY`]); keeps the flash so
-    /// periodic ticks don't eat notices.
+    /// Re-read every repo's git status synchronously: the explicit path used
+    /// right after local ops (stage/commit/...) and the manual `r` refresh.
+    /// Passive file events drive the automatic path through `tick()` instead
+    /// (same tail below, off the UI thread); keeps the flash so background
+    /// runs don't eat notices.
     pub fn refresh(&mut self) {
         let mut error = None;
         for repo in &mut self.repos {
@@ -904,8 +934,17 @@ impl App {
                 }
             }
         }
-        if !self.pane_is_focused() {
-            return;
+        if let Some(rx) = &self.status_rx {
+            match rx.try_recv() {
+                Ok(results) => {
+                    self.status_rx = None;
+                    self.apply_status(results);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.status_rx = None;
+                }
+            }
         }
         if self.repos.is_empty() {
             self.repos = Git::discover_all(&self.cwd)
@@ -916,7 +955,105 @@ impl App {
                 self.discover_err.clear();
             }
         }
-        self.refresh();
+        // Drain OS file events (no IPC, no git — cheap enough every tick).
+        // The pane need not be focused: a visible-but-unfocused git tab must
+        // still refresh; hidden time only stretches the debounce.
+        self.watcher.poll();
+        if self.watcher.is_dirty() {
+            self.status_pending = true;
+        }
+        // Re-resolving gitdirs spawns git, so sync_watches() diffs in-memory
+        // roots first and only re-resolves when the repo set actually moved.
+        self.sync_watches();
+        if self.probe_focus_regained() {
+            self.status_pending = true;
+        }
+        let debounce = if self.was_focused {
+            WATCH_DEBOUNCE_FOCUSED
+        } else {
+            WATCH_DEBOUNCE_IDLE
+        };
+        let quiet = self
+            .watcher
+            .last_event()
+            .is_none_or(|at| at.elapsed() >= debounce);
+        if self.status_pending && self.status_rx.is_none() && quiet {
+            let gits: Vec<Git> = self.repos.iter().map(|r| r.git.clone()).collect();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let results = gits
+                    .into_iter()
+                    .map(|git| {
+                        let root = git.root().to_path_buf();
+                        (root, git.status())
+                    })
+                    .collect();
+                tx.send(results).ok();
+            });
+            self.status_rx = Some(rx);
+            self.status_pending = false;
+            let roots: Vec<PathBuf> = self
+                .repos
+                .iter()
+                .map(|r| r.git.root().to_path_buf())
+                .collect();
+            self.watcher.take_dirty(|| roots);
+        }
+    }
+
+    /// Re-resolve file watches when the repo set moved.
+    fn sync_watches(&mut self) {
+        let current: std::collections::HashSet<PathBuf> =
+            self.repos.iter().map(|r| r.git.root().to_path_buf()).collect();
+        if self.watcher.watched_workdirs() == current { return; }
+        let resolved: Vec<(PathBuf, Option<PathBuf>)> = self
+            .repos
+            .iter()
+            .map(|r| (r.git.root().to_path_buf(), r.git.git_dir()))
+            .collect();
+        self.watcher.sync_roots(&resolved);
+    }
+
+    /// Throttled focus probe (one `pane.list` IPC at most every couple of
+    /// seconds). True on the false->true edge so the caller can force one
+    /// refresh for anything missed while unfocused.
+    fn probe_focus_regained(&mut self) -> bool {
+        if self.last_focus_probe.elapsed() < FOCUS_PROBE_EVERY {
+            return false;
+        }
+        self.last_focus_probe = std::time::Instant::now();
+        let focused = self.pane_is_focused();
+        let regained = focused && !self.was_focused;
+        self.was_focused = focused;
+        regained
+    }
+
+    /// Apply a background `git status` run. Drawer reloads are themselves a
+    /// burst of git reads, so they only run when the status actually changed.
+    fn apply_status(&mut self, results: Vec<(PathBuf, Result<Status, String>)>) {
+        let mut changed = false;
+        let mut error = None;
+        for (root, result) in results {
+            let Some(repo) = self.repos.iter_mut().find(|r| r.git.root() == root) else {
+                continue;
+            };
+            match result {
+                Ok(status) => {
+                    if status != repo.status {
+                        repo.status = status;
+                        changed = true;
+                    }
+                }
+                Err(e) => error = Some(e),
+            }
+        }
+        if let Some(e) = error {
+            self.flash = Some((e, true));
+        }
+        if changed {
+            self.reload_expanded_drawers();
+            self.rebuild();
+        }
     }
 
     pub fn on_resize(&mut self, width: u16) {

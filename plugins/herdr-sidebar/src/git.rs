@@ -88,6 +88,22 @@ impl Git {
         &self.root
     }
 
+    /// The `.git` dir backing this repo: resolves the `.git` FILE form git
+    /// uses for worktrees and submodules into the real directory.
+    pub fn git_dir(&self) -> Option<PathBuf> {
+        let out = run_in(&self.root, &["rev-parse", "--git-dir"]).ok()?;
+        let dir = out.trim();
+        if dir.is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(dir);
+        Some(if path.is_absolute() {
+            path
+        } else {
+            self.root.join(path)
+        })
+    }
+
     /// Display name for repo headers: the root directory's name.
     pub fn name(&self) -> String {
         self.root
