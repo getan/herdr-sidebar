@@ -34,7 +34,9 @@ use herdr_sidebar::ui::{
     title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
     wrap_footer_message, wrap_hints,
 };
-use herdr_sidebar::watch::WorkdirWatcher;
+use herdr_sidebar::watch::{
+    FOCUS_PROBE_EVERY, WATCH_DEBOUNCE_FOCUSED, WATCH_DEBOUNCE_IDLE, WorkdirWatcher,
+};
 
 /// How many log lines the history-ish drawers fetch.
 const DRAWER_LIMIT: usize = 30;
@@ -43,15 +45,6 @@ const DRAWER_LIMIT: usize = 30;
 /// a diff/show tab), matching the file explorer.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
 
-/// File-event debounce while the pane is focused: snappy, yet a save burst
-/// still coalesces into one background `git status`.
-const WATCH_DEBOUNCE_FOCUSED: std::time::Duration = std::time::Duration::from_millis(400);
-/// Same while unfocused: the view still refreshes (it may be visible),
-/// just less eagerly.
-const WATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
-/// `pane.list` focus probes are throttled to this; the watcher itself needs
-/// no focus state to collect events.
-const FOCUS_PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {

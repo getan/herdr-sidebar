@@ -21,6 +21,9 @@ use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::ipc;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
+use herdr_sidebar::watch::{
+    FOCUS_PROBE_EVERY, WATCH_DEBOUNCE_FOCUSED, WATCH_DEBOUNCE_IDLE, WorkdirWatcher,
+};
 use herdr_sidebar::ui::{
     TitleAction, activity_icons, draw_scrollbar, gear_icon, hits, hits_collapse_button, input_tail,
     hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette, selection_style,
@@ -290,6 +293,15 @@ pub struct App {
     /// One background decoration refresh. Keeping at most one receiver avoids
     /// multiplying git processes when a slow repository overlaps the timer.
     deco_rx: Option<std::sync::mpsc::Receiver<Decorations>>,
+    /// Passive refresh: OS file events mark the tree dirty; a debounced
+    /// tick then re-reads the disk and forces one background decoration run.
+    watcher: WorkdirWatcher,
+    /// A debounced tree refresh is waiting for its quiet period.
+    tree_pending: bool,
+    /// Throttled focus probe: a false->true edge forces one refresh so
+    /// events lost while unfocused can never leave a stale tree.
+    was_focused: bool,
+    last_focus_probe: std::time::Instant,
     quick_index: Option<QuickIndex>,
     quick_index_rx: Option<std::sync::mpsc::Receiver<QuickIndex>>,
     collapsed: bool,
@@ -386,6 +398,10 @@ impl App {
             // Overwritten when the first background refresh is queued below.
             last_deco: std::time::Instant::now(),
             deco_rx: None,
+            watcher: WorkdirWatcher::new(),
+            tree_pending: false,
+            was_focused: true,
+            last_focus_probe: std::time::Instant::now(),
             quick_index: None,
             quick_index_rx: None,
             collapsed: false,
@@ -393,6 +409,7 @@ impl App {
         };
         app.apply_identity();
         app.request_decorations(true);
+        app.sync_watches();
         app
     }
 
@@ -400,17 +417,79 @@ impl App {
         self.tree.root_path()
     }
 
-    /// Idle work: keep the git decorations current so changes made outside
-    /// the sidebar (an agent editing files, a commit in another pane) show up
-    /// on their own. Self-throttling, so the event loop may call it freely.
+    /// Idle work: keep the tree and its git decorations current so changes
+    /// made outside the sidebar (an agent editing files, a commit in another
+    /// pane) show up on their own. File events drive the fast path; a timer
+    /// remains as backstop. Self-throttling, so the event loop may call it
+    /// freely.
     pub fn tick(&mut self) {
         self.sync_shared_settings();
         self.collect_quick_index();
         self.collect_decorations();
+        // Passive path: OS file events mark the tree dirty; a debounced
+        // refresh then re-reads the disk (cheap cache clear, rows re-read
+        // lazily) and forces one background decoration run. The pane need
+        // not be focused: a visible-but-unfocused tree must still refresh.
+        self.watcher.poll();
+        if self.watcher.is_dirty() {
+            self.tree_pending = true;
+        }
+        // Re-resolving gitdirs spawns git, so sync_watches() diffs in-memory
+        // roots first and only re-resolves when the repo set actually moved.
+        self.sync_watches();
+        if self.probe_focus_regained() {
+            self.tree_pending = true;
+        }
+        let debounce = if self.was_focused {
+            WATCH_DEBOUNCE_FOCUSED
+        } else {
+            WATCH_DEBOUNCE_IDLE
+        };
+        let quiet = self
+            .watcher
+            .last_event()
+            .is_none_or(|at| at.elapsed() >= debounce);
+        if self.tree_pending && quiet {
+            self.tree_pending = false;
+            let roots: Vec<PathBuf> = self.repos.iter().map(|r| r.root().to_path_buf()).collect();
+            self.watcher.take_dirty(|| roots);
+            self.tree.refresh();
+            self.invalidate_quick_index();
+            self.rediscover_repos();
+            self.request_decorations(true);
+            self.rebuild();
+        }
+        // Timer backstop: if events are ever lost, decorations still converge.
         if self.last_deco.elapsed() < DECO_REFRESH {
             return;
         }
         self.request_decorations(false);
+    }
+
+    /// Re-resolve file watches when the repo set moved.
+    fn sync_watches(&mut self) {
+        let current: std::collections::HashSet<PathBuf> =
+            self.repos.iter().map(|r| r.root().to_path_buf()).collect();
+        if self.watcher.watched_workdirs() == current {
+            return;
+        }
+        let resolved: Vec<(PathBuf, Option<PathBuf>)> =
+            self.repos.iter().map(|r| (r.root().to_path_buf(), r.git_dir())).collect();
+        self.watcher.sync_roots(&resolved);
+    }
+
+    /// Throttled focus probe (one `pane.list` IPC at most every couple of
+    /// seconds). True on the false->true edge so the caller can force one
+    /// refresh for anything missed while unfocused.
+    fn probe_focus_regained(&mut self) -> bool {
+        if self.last_focus_probe.elapsed() < FOCUS_PROBE_EVERY {
+            return false;
+        }
+        self.last_focus_probe = std::time::Instant::now();
+        let focused = self.pane_is_focused();
+        let regained = focused && !self.was_focused;
+        self.was_focused = focused;
+        regained
     }
 
     /// A separated Source Control pane can change this shared setting while

@@ -25,6 +25,15 @@ use std::time::Instant;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
+/// File-event debounce while the pane is focused: snappy, yet a save burst
+/// still coalesces into one refresh.
+pub const WATCH_DEBOUNCE_FOCUSED: std::time::Duration = std::time::Duration::from_millis(400);
+/// Same while unfocused: a visible view still refreshes, just less eagerly.
+pub const WATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+/// `pane.list` focus probes are throttled to this; the watcher itself needs
+/// no focus state to collect events.
+pub const FOCUS_PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Directory/file names that can never affect `git status` and are pure
 /// event noise (build output, vendored envs, editor state).
 const SKIP_NAMES: &[&str] = &[
