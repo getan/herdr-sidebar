@@ -23,11 +23,13 @@ use ratatui::style::{Style, Stylize};
 use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use ratatui_image::Image;
 use unicode_width::UnicodeWidthChar;
 
 use crate::ansi;
 use crate::editor::{EditAction, Editor, SaveOutcome};
 use crate::icons::{IconTheme, icon};
+use crate::imgpreview;
 use crate::ipc;
 use crate::ui::{icon_style as ui_icon_style, palette};
 
@@ -274,6 +276,9 @@ struct Doc {
     /// toggle and a diff refresh keep the reader's place even though the
     /// row index underneath them changed.
     pending_src: Option<usize>,
+    /// Claimed image payload: decoded lazily at draw time once the body
+    /// size is known, so text docs never pay for it.
+    image: Option<imgpreview::ImageDoc>,
     selection: PreviewSelection,
 }
 
@@ -552,6 +557,7 @@ fn load(request: &Request) -> Doc {
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
+            image: None,
             selection: PreviewSelection::default(),
         },
         Request::File(path) => load_file(path),
@@ -693,6 +699,7 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
+        image: None,
         selection: PreviewSelection::default(),
     }
 }
@@ -745,6 +752,21 @@ fn load_file(target: &Path) -> Doc {
     let (lines, numbered) = match std::fs::read(target) {
         Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true),
         Ok(bytes) => {
+            if let Some(image) = imgpreview::ImageDoc::try_new(&name, &bytes) {
+                return Doc {
+                    name,
+                    context: target.display().to_string(),
+                    lines: Vec::new(),
+                    numbered: false,
+                    scroll: 0,
+                    wrap: true,
+                    rows: Vec::new(),
+                    rows_key: None,
+                    pending_src: None,
+                    selection: PreviewSelection::default(),
+                    image: Some(image),
+                };
+            }
             if bytes.contains(&0) {
                 (
                     vec![Line::raw(format!("(binary file — {} bytes)", bytes.len()))],
@@ -794,6 +816,7 @@ fn load_file(target: &Path) -> Doc {
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
+        image: None,
         selection: PreviewSelection::default(),
     }
 }
@@ -856,6 +879,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
+        image: None,
         selection: PreviewSelection::default(),
     }
 }
@@ -1094,6 +1118,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
+        image: None,
         selection: PreviewSelection::default(),
     });
     let mut mode = ViewMode::Preview(doc);
@@ -1495,6 +1520,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     };
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    imgpreview::clear_graphics();
     result
 }
 
@@ -1555,17 +1581,42 @@ fn draw_doc(
     // Rows are pre-wrapped, so the Paragraph never wraps for us: its
     // continuations would render past the bottom of the pane, where no
     // amount of scrolling could reach them.
-    let selection = doc.selection_range();
-    let gutter = doc.gutter();
-    let text: Vec<Line> = doc
-        .rows
-        .iter()
-        .enumerate()
-        .skip(doc.scroll)
-        .take(usize::from(body.height))
-        .map(|(row, rendered)| selected_row(&rendered.line, gutter, row, selection))
-        .collect();
-    frame.render_widget(Paragraph::new(text), body);
+    if doc.image.is_some() {
+        // Images pin to the top of the body: there are no text rows to scroll.
+        doc.scroll = 0;
+        let protocol = doc
+            .image
+            .as_mut()
+            .and_then(|claimed| claimed.protocol_for(body.width, body.height));
+        match protocol {
+            Some(rendered) => {
+                if imgpreview::needs_clear(rendered) {
+                    imgpreview::mark_graphics_active();
+                }
+                frame.render_widget(Image::new(rendered).allow_clipping(true), body);
+            }
+            None => {
+                imgpreview::clear_graphics();
+                frame.render_widget(
+                    Paragraph::new(Line::raw("(cannot preview this image)")).dim(),
+                    body,
+                );
+            }
+        }
+    } else {
+        imgpreview::clear_graphics();
+        let selection = doc.selection_range();
+        let gutter = doc.gutter();
+        let text: Vec<Line> = doc
+            .rows
+            .iter()
+            .enumerate()
+            .skip(doc.scroll)
+            .take(usize::from(body.height))
+            .map(|(row, rendered)| selected_row(&rendered.line, gutter, row, selection))
+            .collect();
+        frame.render_widget(Paragraph::new(text), body);
+    }
 
     let wrap_hint = if doc.wrap {
         "w: wrap on"
@@ -1791,6 +1842,7 @@ fn run_external_editor(
         crossterm::event::DisableMouseCapture
     );
     ratatui::restore();
+    imgpreview::clear_graphics();
     let status = std::process::Command::new(program)
         .args(args)
         .arg(path)
@@ -2572,6 +2624,7 @@ mod tests {
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
+            image: None,
             selection: PreviewSelection::default(),
         }
     }

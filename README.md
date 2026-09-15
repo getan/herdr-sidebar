@@ -68,6 +68,9 @@ A real tree, not a directory dump:
   preview splits in right beside the sidebar instead, in the tab you clicked from —
   one viewer pane per tab, reused for every file, with focus left in the tree so you
   can keep walking it with the arrow keys. `q` or Esc closes just that pane.
+- **Images preview inline** — PNG/JPEG/GIF/WebP and friends render right in the preview
+  pane via kitty graphics (Ghostty, RootShell, kitty, …) with halfblock characters as the
+  fallback. Override detection with `HERDR_SIDEBAR_IMG_PREVIEW=auto|kitty|block|off`.
 - **Quick-open any file with `Ctrl+P`** — type a few characters from its path, use
   `↑`/`↓` to choose a fuzzy match, and press Enter to open it through the same reusable
   preview flow. The index follows the Explorer's dotfile setting, honors git ignore rules,

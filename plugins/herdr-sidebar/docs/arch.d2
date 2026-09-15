@@ -1,0 +1,19 @@
+direction: down
+
+herdr: "herdr CLI" 
+actions: "plugin actions\nopen-sidebar open-git redeploy"
+scripts: "scripts/*.sh"
+binary: "herdr-sidebar binary\nmain.rs + launch.rs"
+explorer: "Explorer TUI\nexplorer_app.rs"
+scm: "SCM TUI\nscm_app.rs"
+shared: "shared\ntree.rs watch.rs git.rs"
+suggest: "commit suggest\nsuggest.rs -> codex CLI"
+editor: "external editor\neditor.rs -> nvim"
+
+herdr -> actions -> scripts -> binary
+binary -> explorer
+binary -> scm
+explorer -> shared
+scm -> shared
+scm -> suggest
+explorer -> editor

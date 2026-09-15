@@ -45,6 +45,8 @@ ignore = "0.4"
 # OS file events (FSEvents on macOS) for passive Source Control refresh:
 # idle costs ~nothing, changes surface without timer polling.
 notify = "8"
+ratatui-image = { version = "11.0.8", default-features = false, features = ["crossterm", "image-defaults"] }
+image = "0.25"
 
 # Native folder picker for "Change Folder" on Windows. macOS uses osascript:
 # rfd's Cocoa backend aborts when called from the background thread required

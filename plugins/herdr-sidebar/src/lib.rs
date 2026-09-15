@@ -12,6 +12,7 @@ pub mod fontsetup;
 pub mod git;
 pub mod gitdeco;
 pub mod icons;
+pub mod imgpreview;
 pub mod ipc;
 pub mod launch;
 pub mod snooze;
