@@ -531,11 +531,14 @@ impl App {
                 .is_some_and(|(before, now)| before != now);
             self.last_layout_width = layout_width.or(self.last_layout_width);
             if surrounding_changed {
-                ctl.resize_preferred(
-                    width,
-                    self.sidebar_state.sidebar_width,
-                    self.sidebar_state.dock_right,
-                );
+                // Stay a sliver while collapsed: a new client or rotation
+                // must not yank the pane back to the expanded width.
+                let target = if self.collapsed {
+                    Self::COLLAPSED_WIDTH
+                } else {
+                    self.sidebar_state.sidebar_width
+                };
+                ctl.resize_preferred(width, target, self.sidebar_state.dock_right);
             }
         }
     }
