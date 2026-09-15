@@ -9,6 +9,7 @@
 //! - `follow_cwd`: follow the live cwd of the neighbouring pane.
 //! - `dock_right`: dock at the right edge instead of the default left edge.
 //! - `sidebar_width`: preferred sidebar width in terminal columns.
+//! - `collapsed`: folded to the narrow strip (view switches keep it).
 //!
 //! Both views live in ONE binary; switching is an in-process re-render, and
 //! separated panes are the same binary pinned to a starting view with
@@ -264,6 +265,10 @@ pub struct State {
     /// Dock the sidebar at the right edge of each tab. False preserves the
     /// historical left dock.
     pub dock_right: bool,
+    /// Folded to the narrow strip. Shared so a view switch (which recreates
+    /// the app) and a pane respawn keep the fold instead of squeezing full
+    /// content into a sliver.
+    pub collapsed: bool,
     /// Preferred pane width in terminal columns. Layout code keeps this
     /// column target in the normal range and yields proportionally when the
     /// tab becomes unusually narrow.
@@ -292,6 +297,7 @@ impl Default for State {
             follow_cwd: true,
             git_deco: true,
             dock_right: false,
+            collapsed: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             preview_placement: PreviewPlacement::Tab,
             editor_cmd: "nvim".to_string(),
@@ -435,7 +441,7 @@ fn write_state(path: &Path, state: State) {
     };
     let editor_json = serde_json::to_string(&state.editor_cmd).unwrap_or_default();
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"editor_cmd\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"collapsed\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"editor_cmd\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.show_hotkeys,
@@ -446,6 +452,7 @@ fn write_state(path: &Path, state: State) {
         state.follow_cwd,
         state.git_deco,
         state.dock_right,
+        state.collapsed,
         clamp_sidebar_width(state.sidebar_width),
         state.color_theme.label(),
         state.preview_placement.label(),
@@ -874,6 +881,10 @@ pub fn parse_state(json: &str) -> State {
             .get("dock_right")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.dock_right),
+        collapsed: value
+            .get("collapsed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.collapsed),
         sidebar_width: value
             .get("sidebar_width")
             .and_then(|v| v.as_u64())
@@ -1028,11 +1039,12 @@ mod tests {
             follow_cwd: false,
             git_deco: false,
             dock_right: true,
+            collapsed: true,
             sidebar_width: 44,
             preview_placement: PreviewPlacement::Pane,
             editor_cmd: "nvim".to_string(),
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"editor_cmd\":\"nvim\",\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"collapsed\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"editor_cmd\":\"nvim\",\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
@@ -1069,6 +1081,7 @@ mod tests {
         assert!(parse_state("{\"merged\":true}").git_deco);
         // Files written before the dock setting existed stay left-docked.
         assert!(!parse_state("{\"merged\":true}").dock_right);
+        assert!(!parse_state("{\"merged\":true}").collapsed);
         assert_eq!(parse_state("{\"merged\":true}").sidebar_width, 32);
         assert_eq!(parse_state("{\"sidebar_width\":1}").sidebar_width, 24);
         assert_eq!(parse_state("{\"sidebar_width\":999}").sidebar_width, 80);

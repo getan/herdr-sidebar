@@ -730,6 +730,9 @@ impl App {
             cwd_follower,
             persisted_draft_roots,
         };
+        if app.sidebar_state.collapsed {
+            app.collapse();
+        }
         app.apply_identity();
         app.refresh();
         app.sync_watches();
@@ -793,11 +796,13 @@ impl App {
         if self.collapsed { return; }
         self.expanded_width = self.last_width.max(20);
         self.collapsed = true;
+        self.sidebar_state = sidebar::update_state(|state| state.collapsed = true);
         if let Some(ctl) = &self.pane_ctl { ctl.resize_to(self.last_width, Self::COLLAPSED_WIDTH, self.sidebar_state.dock_right); }
     }
     fn restore(&mut self) {
         if !self.collapsed { return; }
         self.collapsed = false;
+        self.sidebar_state = sidebar::update_state(|state| state.collapsed = false);
         let target = self.expanded_width.clamp(24, 80);
         if let Some(ctl) = &self.pane_ctl { ctl.resize_to(self.last_width, target, self.sidebar_state.dock_right); }
     }
