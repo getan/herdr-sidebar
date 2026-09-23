@@ -175,7 +175,7 @@ impl Request {
     fn doc_key(&self) -> String {
         match self {
             Self::Close => String::new(),
-            Self::File(p) => doc_key_for_file(p),
+            Self::File { path: p, .. } => doc_key_for_file(p),
             Self::Diff { root, rel, kind } => doc_key_for_diff(root, rel, kind),
             Self::Show { root, spec, path } => doc_key_for_show(root, spec, path.as_deref()),
         }
@@ -188,7 +188,11 @@ enum Request {
     /// Graceful close request from the sidebar. The viewer gets a chance to
     /// confirm unsaved edits before it closes its own pane.
     Close,
-    File(PathBuf),
+    File {
+        path: PathBuf,
+        /// One-based source line to place at the top of the preview.
+        line: Option<usize>,
+    },
     Diff {
         root: PathBuf,
         rel: String,
@@ -207,6 +211,11 @@ enum Request {
 /// Control-file payload for a file preview.
 pub fn file_request(path: &Path) -> String {
     format!("file\t{}", path.display())
+}
+
+/// Control-file payload for a file preview anchored to a one-based source line.
+pub fn file_request_at(path: &Path, line: usize) -> String {
+    format!("file\t{}\t{line}", path.display())
 }
 
 /// Control-file payload for a git diff (`kind`: staged | worktree | untracked).
@@ -240,16 +249,25 @@ fn parse_request(raw: &str) -> Option<Request> {
             let path = parts.next().filter(|p| !p.is_empty()).map(str::to_string);
             Some(Request::Show { root, spec, path })
         }
-        Some("file") => Some(Request::File(PathBuf::from(parts.next()?))),
+        Some("file") => {
+            let path = PathBuf::from(parts.next()?);
+            let line = parts.next().and_then(|n| n.parse::<usize>().ok());
+            Some(Request::File { path, line })
+        }
         // Legacy: a bare path.
-        _ => Some(Request::File(PathBuf::from(raw))),
+        _ => Some(Request::File {
+            path: PathBuf::from(raw),
+            line: None,
+        }),
     }
 }
 
 fn request_payload(request: &Request) -> String {
     match request {
         Request::Close => "close".into(),
-        Request::File(path) => file_request(path),
+        Request::File { path, line } => line
+            .map(|line| file_request_at(path, line))
+            .unwrap_or_else(|| file_request(path)),
         Request::Diff { root, rel, kind } => diff_request(root, rel, kind),
         Request::Show { root, spec, path } => show_request(root, spec, path.as_deref()),
     }
@@ -560,7 +578,7 @@ fn load(request: &Request) -> Doc {
             image: None,
             selection: PreviewSelection::default(),
         },
-        Request::File(path) => load_file(path),
+        Request::File { path, line } => load_file(path, *line),
         Request::Diff { root, rel, kind } => load_diff(root, rel, kind),
         Request::Show { root, spec, path } => load_show(root, spec, path.as_deref()),
     }
@@ -742,7 +760,7 @@ fn glow_markdown(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
     Some(lines)
 }
 
-fn load_file(target: &Path) -> Doc {
+fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -781,7 +799,7 @@ fn load_file(target: &Path) -> Doc {
                 let glow_width = crossterm::terminal::size()
                     .map(|(w, _)| w.saturating_sub(6))
                     .unwrap_or(74);
-                let glow_rendered = is_markdown
+                let glow_rendered = (is_markdown && target_line.is_none())
                     .then(|| glow_markdown(&text, glow_width))
                     .flatten();
                 // Glow-rendered markdown gets no line numbers (it formats its own layout).
@@ -815,7 +833,7 @@ fn load_file(target: &Path) -> Doc {
         wrap: true,
         rows: Vec::new(),
         rows_key: None,
-        pending_src: None,
+        pending_src: target_line.map(|line| line.saturating_sub(1)),
         image: None,
         selection: PreviewSelection::default(),
     }
@@ -1156,7 +1174,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     frame,
                     doc,
                     theme,
-                    matches!(current, Some(Request::File(_))),
+                    matches!(current, Some(Request::File { .. })),
                     notice.as_deref(),
                 );
             }
@@ -1283,7 +1301,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         should_close = close_own_pane(control);
                                     }
                                     KeyCode::Char('e') => {
-                                        if let Some(Request::File(path)) = current.as_ref() {
+                                        if let Some(Request::File { path, .. }) = current.as_ref() {
                                             match Editor::open(path, MAX_BYTES, MAX_LINES) {
                                                 Ok(editor) => {
                                                     mode = ViewMode::Edit(editor);
@@ -1306,14 +1324,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         }
                                     }
                                     KeyCode::Char('E') => {
-                                        if let Some(Request::File(path)) = current.as_ref() {
+                                        if let Some(Request::File { path, .. }) = current.as_ref() {
                                             match external_editor() {
                                                 Some((program, args)) => {
                                                     match run_external_editor(
                                                         &mut terminal, &program, &args, path,
                                                     ) {
                                                         Ok(true) => {
-                                                            if let Some(req @ Request::File(_)) =
+                                                            if let Some(req @ Request::File { .. }) =
                                                                 current.clone()
                                                             {
                                                                 *doc = load(&req);
@@ -3270,7 +3288,7 @@ mod tests {
         let mut bytes = vec![b'a'; 9000];
         bytes.push(0);
         std::fs::write(&path, bytes).unwrap();
-        let doc = load_file(&path);
+        let doc = load_file(&path, None);
         let rendered: String = doc.lines[0]
             .spans
             .iter()
@@ -3423,7 +3441,18 @@ mod tests {
         let f = file_request(Path::new("C:/x/y.rs"));
         assert_eq!(
             parse_request(&f),
-            Some(Request::File(PathBuf::from("C:/x/y.rs")))
+            Some(Request::File {
+                path: PathBuf::from("C:/x/y.rs"),
+                line: None,
+            })
+        );
+        let f = file_request_at(Path::new("C:/x/y.rs"), 42);
+        assert_eq!(
+            parse_request(&f),
+            Some(Request::File {
+                path: PathBuf::from("C:/x/y.rs"),
+                line: Some(42),
+            })
         );
         let s = show_request(Path::new("C:/repo"), "stash@{1}", None);
         assert_eq!(
@@ -3455,7 +3484,10 @@ mod tests {
         // Legacy bare path still works.
         assert_eq!(
             parse_request("C:/plain.txt"),
-            Some(Request::File(PathBuf::from("C:/plain.txt")))
+            Some(Request::File {
+                path: PathBuf::from("C:/plain.txt"),
+                line: None,
+            })
         );
         assert_eq!(parse_request("  "), None);
     }

@@ -886,11 +886,13 @@ name = "herdr-sidebar"
 version = "0.11.0"
 dependencies = [
  "crossterm",
+ "globset",
  "ignore",
  "image",
  "notify",
  "ratatui",
  "ratatui-image",
+ "regex",
  "rfd",
  "serde",
  "serde_json",

@@ -28,11 +28,11 @@ use herdr_sidebar::state::Exit;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
-    TitleAction, activity_icons, branch_icon, draw_scrollbar, gear_icon, hits,
-    hits_collapse_button, hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette,
-    selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
-    title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
-    wrap_footer_message, wrap_hints,
+    TitleAction, activity_button_style, activity_icons, branch_icon, draw_activity_caps,
+    draw_scrollbar, gear_icon, hits, hits_collapse_button, hover_style,
+    icon_style as ui_icon_style, keep_visible_scroll, palette, selection_style, set_color_theme,
+    sibling_panes_of, sparkle_icon, status_color, title_action_spans, title_actions_visible,
+    title_actions_width, truncate_to, within, wrap_footer_message, wrap_hints,
 };
 use herdr_sidebar::watch::{
     FOCUS_PROBE_EVERY, WATCH_DEBOUNCE_FOCUSED, WATCH_DEBOUNCE_IDLE, WorkdirWatcher,
@@ -440,6 +440,7 @@ struct BodyGeom {
 struct ClickZones {
     activity_row: u16,
     explorer: (u16, u16),
+    search: (u16, u16),
     source_control: (u16, u16),
     /// The ⚙ button (activity bar in unified mode, header otherwise).
     gear: Rect,
@@ -1264,6 +1265,29 @@ impl App {
             return Some(Exit::Quit);
         }
         self.flash = None;
+        // View switching reaches past the commit message box, where bare
+        // 1/2/3 type into the draft — Ctrl+1/2/3 mirror VS Code's activity
+        // bar from any focus (1 Explorer, 2 Source Control, 3 Search).
+        if let Some(c) = match key.code {
+            KeyCode::Char(c @ ('1' | '2' | '3')) => Some(c),
+            _ => None,
+        }
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            self.overlay = None;
+            return match c {
+                '1' => self.switch_to(View::Explorer),
+                '2' => self.switch_to(View::SourceControl),
+                _ => self.open_search(false),
+            };
+        }
+        if matches!(key.code, KeyCode::Char('f' | 'F'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            return self.open_search(true);
+        }
         if self.overlay.is_some() {
             self.overlay_key(key);
             return None;
@@ -1362,6 +1386,7 @@ impl App {
             KeyCode::Char('b') => self.hide(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.switch_to(View::SourceControl),
+            KeyCode::Char('3') => return self.open_search(false),
             _ => {}
         }
         None
@@ -1413,6 +1438,9 @@ impl App {
         if self.merged() && y == z.activity_row {
             if within(x, z.explorer) {
                 return self.switch_to(View::Explorer);
+            }
+            if within(x, z.search) {
+                return self.open_search(false);
             }
             if within(x, z.source_control) {
                 return self.switch_to(View::SourceControl);
@@ -2672,8 +2700,22 @@ impl App {
         if !self.merged() || view == MY_VIEW {
             return None;
         }
-        self.sidebar_state = sidebar::update_state(|state| state.active = view);
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.active = view;
+            state.search_active = false;
+        });
         Some(Exit::Switch)
+    }
+
+    fn open_search(&mut self, focus_query: bool) -> Option<Exit> {
+        if !self.merged() {
+            return None;
+        }
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.active = View::Explorer;
+            state.search_active = true;
+        });
+        Some(Exit::Search { focus_query })
     }
 
     /// Close the other panel's standalone pane in our tab, if one is open.
@@ -3006,12 +3048,16 @@ impl App {
             frame.render_widget(Clear, area);
             let cx = area.x;
             let w = area.width;
-            let is_exp = self.sidebar_state.active == View::Explorer;
+            let is_search = self.sidebar_state.search_active;
+            let is_exp = self.sidebar_state.active == View::Explorer && !is_search;
+            let is_git = self.sidebar_state.active == View::SourceControl && !is_search;
             let e_line = if is_exp { ratatui::text::Line::from(vec!["1 ".dim(), "●".green()]) } else { ratatui::text::Line::from(vec!["1 ".dim(), "○".dim()]) };
-            let s_line = if !is_exp { ratatui::text::Line::from(vec!["2 ".dim(), "●".green()]) } else { ratatui::text::Line::from(vec!["2 ".dim(), "○".dim()]) };
-            if area.height > 2 {
+            let g_line = if is_git { ratatui::text::Line::from(vec!["2 ".dim(), "●".green()]) } else { ratatui::text::Line::from(vec!["2 ".dim(), "○".dim()]) };
+            let s_line = if is_search { ratatui::text::Line::from(vec!["3 ".dim(), "●".green()]) } else { ratatui::text::Line::from(vec!["3 ".dim(), "○".dim()]) };
+            if area.height > 3 {
                 frame.render_widget(ratatui::widgets::Paragraph::new(e_line).alignment(ratatui::layout::Alignment::Center), ratatui::layout::Rect{ x: cx, y: area.y+1, width: w, height: 1});
-                frame.render_widget(ratatui::widgets::Paragraph::new(s_line).alignment(ratatui::layout::Alignment::Center), ratatui::layout::Rect{ x: cx, y: area.y+2, width: w, height: 1});
+                frame.render_widget(ratatui::widgets::Paragraph::new(g_line).alignment(ratatui::layout::Alignment::Center), ratatui::layout::Rect{ x: cx, y: area.y+2, width: w, height: 1});
+                frame.render_widget(ratatui::widgets::Paragraph::new(s_line).alignment(ratatui::layout::Alignment::Center), ratatui::layout::Rect{ x: cx, y: area.y+3, width: w, height: 1});
             }
             if area.height > 1 {
                 let by = area.y + area.height.saturating_sub(1);
@@ -3123,14 +3169,7 @@ impl App {
         let outer_top = area.y;
         let outer_bottom = area.y + 2;
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let (exp_icon, git_icon) = activity_icons(self.theme);
-        let active = |on: bool| {
-            if on {
-                selection_style(true)
-            } else {
-                Style::default().dim()
-            }
-        };
+        let (exp_icon, search_icon, git_icon) = activity_icons(self.theme);
         // Both FA glyphs (folder, code-fork) render two cells wide in the
         // non-Mono Nerd Font; reserve the second cell in each chip so the
         // highlights are equal-sized with centered icons.
@@ -3139,11 +3178,13 @@ impl App {
         } else {
             ""
         };
-        let spans = [
+        let mut spans = [
             Span::raw(" "),
-            Span::styled(format!(" {exp_icon}{slack} "), active(false)),
+            Span::raw(format!(" {exp_icon}{slack} ")),
             Span::raw(" "),
-            Span::styled(format!(" {git_icon}{slack} "), active(true)),
+            Span::raw(format!(" {git_icon}{slack} ")),
+            Span::raw(" "),
+            Span::raw(format!(" {search_icon}{slack} ")),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -3156,16 +3197,37 @@ impl App {
         self.zones.activity_row = area.y;
         self.zones.explorer = bounds[1];
         self.zones.source_control = bounds[3];
-        // Symmetric half-block caps: a 2-cell button with the icon in its
-        // vertical center.
-        let (chip_start, chip_end) = bounds[3];
-        let chip_w = chip_end.saturating_sub(chip_start);
-        let cap = |glyph: &str| {
-            Paragraph::new(glyph.repeat(usize::from(chip_w)))
-                .style(Style::default().fg(palette().selection_bg))
+        self.zones.search = bounds[5];
+        let hovered = |bounds| {
+            self.mouse_pos
+                .is_some_and(|(hx, hy)| within(hx, bounds) && hy == area.y)
         };
-        frame.render_widget(cap("▄"), Rect::new(chip_start, outer_top, chip_w, 1));
-        frame.render_widget(cap("▀"), Rect::new(chip_start, outer_bottom, chip_w, 1));
+        let explorer_hovered = hovered(bounds[1]);
+        let git_hovered = hovered(bounds[3]);
+        let search_hovered = hovered(bounds[5]);
+        spans[1].style = activity_button_style(false, explorer_hovered);
+        spans[3].style = activity_button_style(true, git_hovered);
+        spans[5].style = activity_button_style(false, search_hovered);
+        draw_activity_caps(
+            frame,
+            bounds[3],
+            outer_top,
+            outer_bottom,
+            palette().selection_bg,
+        );
+        for (button_bounds, is_hovered) in
+            [(bounds[1], explorer_hovered), (bounds[5], search_hovered)]
+        {
+            if is_hovered {
+                draw_activity_caps(
+                    frame,
+                    button_bounds,
+                    outer_top,
+                    outer_bottom,
+                    palette().hover_bg,
+                );
+            }
+        }
         let gear = Span::styled(
             format!(" {} ", gear_icon(self.theme)),
             Style::default().dim(),
@@ -3570,7 +3632,7 @@ impl App {
             ("q", "quit"),
         ];
         if self.merged() {
-            hints.extend([("1", "files"), ("2", "git")]);
+            hints.extend([("1", "files"), ("2", "git"), ("3", "search")]);
         }
         hints
     }

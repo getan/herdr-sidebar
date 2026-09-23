@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::icons::IconTheme;
@@ -390,14 +390,61 @@ pub fn hits_collapse_button(column: u16, row: u16, pane_width: u16, pane_height:
     row == pane_height.saturating_sub(1) && column >= pane_width.saturating_sub(4)
 }
 
-/// Theme-matched activity-bar icons: (explorer, source control). Both FA
-/// glyphs render two cells wide in the non-Mono Nerd Font — chips reserve
-/// the second cell (see the activity-bar renderer).
-pub fn activity_icons(theme: IconTheme) -> (&'static str, &'static str) {
+/// Theme-matched activity-bar icons: (explorer, search, source control).
+/// Both FA glyphs render two cells wide in the non-Mono Nerd Font — chips
+/// reserve the second cell (see the activity-bar renderer).
+pub fn activity_icons(theme: IconTheme) -> (&'static str, &'static str, &'static str) {
     match theme {
-        IconTheme::Material => ("\u{f07b}", "\u{f126}"),
-        IconTheme::Emoji => ("📁", "🔀"),
+        IconTheme::Material => ("\u{f07b}", "\u{f002}", "\u{f126}"),
+        IconTheme::Emoji => ("📁", "🔍", "🔀"),
     }
+}
+
+/// Idle/hover styling shared by compact chrome buttons. Title actions and
+/// always-visible toolbars should look like one family rather than inventing
+/// a separate filled-button treatment for each surface.
+pub fn chrome_button_style(hovered: bool) -> Style {
+    if hovered {
+        Style::default()
+            .bg(palette().keycap_bg)
+            .fg(palette().keycap_fg)
+    } else {
+        Style::default().dim()
+    }
+}
+
+/// Activity-bar buttons keep the stronger selected chip when active and use
+/// a subtle hover wash when inactive.
+pub fn activity_button_style(active: bool, hovered: bool) -> Style {
+    if active {
+        selection_style(true)
+    } else if hovered {
+        Style::default()
+            .bg(palette().hover_bg)
+            .fg(palette().keycap_fg)
+    } else {
+        Style::default().dim()
+    }
+}
+
+/// Extend an activity button's middle-row fill into its spacer rows with
+/// half blocks. Hover and selection use the exact same three-row geometry.
+pub fn draw_activity_caps(
+    frame: &mut Frame,
+    bounds: (u16, u16),
+    outer_top: u16,
+    outer_bottom: u16,
+    color: Color,
+) {
+    let width = bounds.1.saturating_sub(bounds.0);
+    if width == 0 {
+        return;
+    }
+    let cap = |glyph: &str| {
+        Paragraph::new(glyph.repeat(usize::from(width))).style(Style::default().fg(color))
+    };
+    frame.render_widget(cap("▄"), Rect::new(bounds.0, outer_top, width, 1));
+    frame.render_widget(cap("▀"), Rect::new(bounds.0, outer_bottom, width, 1));
 }
 
 /// Theme-matched ⚙ settings glyph.
@@ -514,6 +561,11 @@ pub fn title_action_spans(
 
 pub fn within(x: u16, (start, end): (u16, u16)) -> bool {
     (start..end).contains(&x)
+}
+
+pub fn hits_activity_button((start, end): (u16, u16), middle_row: u16, x: u16, y: u16) -> bool {
+    within(x, (start, end))
+        && (middle_row.saturating_sub(1)..=middle_row.saturating_add(1)).contains(&y)
 }
 
 pub fn hits(rect: Rect, x: u16, y: u16) -> bool {

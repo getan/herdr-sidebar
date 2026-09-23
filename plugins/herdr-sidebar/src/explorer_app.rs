@@ -7,11 +7,13 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
+use regex::{Regex, RegexBuilder};
 use unicode_width::UnicodeWidthChar;
 
 use herdr_sidebar::actions::{self, MenuAction, MenuEntry};
@@ -25,10 +27,11 @@ use herdr_sidebar::watch::{
     FOCUS_PROBE_EVERY, WATCH_DEBOUNCE_FOCUSED, WATCH_DEBOUNCE_IDLE, WorkdirWatcher,
 };
 use herdr_sidebar::ui::{
-    TitleAction, activity_icons, draw_scrollbar, gear_icon, hits, hits_collapse_button, input_tail,
+    TitleAction, activity_button_style, activity_icons, chrome_button_style, draw_activity_caps,
+    draw_scrollbar, gear_icon, hits, hits_activity_button, hits_collapse_button, input_tail,
     hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette, selection_style,
-    set_color_theme, sibling_panes_of, status_color, title_action_spans, title_actions_visible,
-    title_actions_width, truncate_to, wrap_footer_message, wrap_hints,
+    set_color_theme, sibling_panes_of, status_color, title_action_icon, title_action_spans,
+    title_actions_visible, title_actions_width, truncate_to, wrap_footer_message, wrap_hints,
 };
 
 use herdr_sidebar::state::Exit;
@@ -188,6 +191,39 @@ enum Overlay {
         truncated: bool,
         loading: bool,
     },
+    ContentSearch {
+        query: String,
+        replace: String,
+        include: String,
+        exclude: String,
+        hits: std::sync::Arc<Vec<ContentHit>>,
+        selected: usize,
+        truncated: bool,
+        loading: bool,
+        searched: bool,
+        details_expanded: bool,
+        focus: SearchFocus,
+        options: SearchOptions,
+        error: Option<String>,
+        dirty_since: Option<std::time::Instant>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SearchOptions {
+    match_case: bool,
+    whole_word: bool,
+    regex: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SearchFocus {
+    #[default]
+    Query,
+    Replace,
+    Include,
+    Exclude,
+    Results,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +238,27 @@ struct QuickIndex {
     show_hidden: bool,
     files: std::sync::Arc<Vec<QuickFile>>,
     truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContentHit {
+    path: PathBuf,
+    label: String,
+    line: usize,
+    context: String,
+    matches: Vec<(usize, usize)>,
+}
+
+struct ContentSearchResult {
+    root: PathBuf,
+    show_hidden: bool,
+    query: String,
+    include: String,
+    exclude: String,
+    options: SearchOptions,
+    hits: std::sync::Arc<Vec<ContentHit>>,
+    truncated: bool,
+    error: Option<String>,
 }
 
 /// One row of the Settings modal.
@@ -252,6 +309,10 @@ pub struct App {
     hovered: Option<usize>,
     body: BodyGeom,
     overlay: Option<Overlay>,
+    /// A search overlay parked under a modal (Settings) opened from the
+    /// Search view, restored with its query when the modal closes so the
+    /// panel doesn't silently drop back to the tree.
+    suspended_search: Option<Overlay>,
     /// Transient status/error line shown in the footer until the next action.
     notice: Option<String>,
     // Merged-sidebar state.
@@ -304,6 +365,11 @@ pub struct App {
     last_focus_probe: std::time::Instant,
     quick_index: Option<QuickIndex>,
     quick_index_rx: Option<std::sync::mpsc::Receiver<QuickIndex>>,
+    content_search_rx: Option<std::sync::mpsc::Receiver<ContentSearchResult>>,
+    search_zones: SearchZones,
+    search_result_rows: Vec<(Rect, usize)>,
+    search_scroll: usize,
+    search_snap: bool,
     collapsed: bool,
     expanded_width: u16,
 }
@@ -312,11 +378,12 @@ pub struct App {
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
 
 /// Activity-bar click zones from the last draw: the bar's row and the column
-/// ranges of the explorer / source-control icons.
+/// ranges of the explorer / search / source-control icons.
 #[derive(Clone, Copy)]
 struct ActivityZones {
     row: u16,
     explorer: (u16, u16),
+    search: (u16, u16),
     source_control: (u16, u16),
 }
 
@@ -326,9 +393,24 @@ impl Default for ActivityZones {
         Self {
             row: u16::MAX,
             explorer: (0, 0),
+            search: (0, 0),
             source_control: (0, 0),
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct SearchZones {
+    query: Rect,
+    replace: Rect,
+    include: Rect,
+    exclude: Rect,
+    match_case: Rect,
+    whole_word: Rect,
+    regex: Rect,
+    refresh: Rect,
+    clear: Rect,
+    details: Rect,
 }
 
 impl App {
@@ -380,6 +462,7 @@ impl App {
             hovered: None,
             body: BodyGeom::default(),
             overlay: None,
+            suspended_search: None,
             notice: None,
             sidebar_state,
             other_exe,
@@ -404,6 +487,11 @@ impl App {
             last_focus_probe: std::time::Instant::now(),
             quick_index: None,
             quick_index_rx: None,
+            content_search_rx: None,
+            search_zones: SearchZones::default(),
+            search_result_rows: Vec::new(),
+            search_scroll: 0,
+            search_snap: false,
             collapsed: false,
             expanded_width: sidebar_width,
         };
@@ -428,6 +516,8 @@ impl App {
     pub fn tick(&mut self) {
         self.sync_shared_settings();
         self.collect_quick_index();
+        self.collect_content_search();
+        self.start_content_search_if_due();
         self.collect_decorations();
         // Passive path: OS file events mark the tree dirty; a debounced
         // refresh then re-reads the disk (cheap cache clear, rows re-read
@@ -679,11 +769,17 @@ impl App {
     /// visible): the shared viewer client reuses the tab's viewer pane or
     /// spawns one next to us.
     fn open_preview(&mut self, path: &Path) {
+        self.open_preview_at(path, None);
+    }
+
+    fn open_preview_at(&mut self, path: &Path, line: Option<usize>) {
         let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
             self.notice = Some("preview needs a herdr pane".into());
             return;
         };
-        let payload = herdr_sidebar::viewer::file_request(path);
+        let payload = line
+            .map(|line| herdr_sidebar::viewer::file_request_at(path, line))
+            .unwrap_or_else(|| herdr_sidebar::viewer::file_request(path));
         let doc_key = herdr_sidebar::viewer::doc_key_for_file(path);
         match herdr_sidebar::viewer::open_in_pane(
             &pane_id,
@@ -766,7 +862,10 @@ impl App {
         if !self.merged() || view == MY_VIEW {
             return None;
         }
-        self.sidebar_state = sidebar::update_state(|state| state.active = view);
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.active = view;
+            state.search_active = false;
+        });
         Some(Exit::Switch)
     }
 
@@ -837,13 +936,77 @@ impl App {
         if key.code == KeyCode::Char('p')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
-            && self.overlay.is_none()
+            && (self.overlay.is_none()
+                || matches!(self.overlay, Some(Overlay::ContentSearch { .. })))
         {
+            self.suspended_search = None;
             self.open_quick_open();
             return None;
         }
+        if matches!(key.code, KeyCode::Char('f' | 'F'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            if let Some(Overlay::ContentSearch { focus, .. }) = self.overlay.as_mut() {
+                *focus = SearchFocus::Query;
+            } else if self.overlay.is_none() {
+                // Ctrl+F is the "find" gesture — open ready to type.
+                self.open_content_search(true);
+            }
+            return None;
+        }
+        // View switching from the keyboard, VS Code's activity-bar order:
+        // 1 Explorer, 2 Source Control, 3 Search. Ctrl+1/2/3 always switch,
+        // so they work even mid-word in a focused search field. Bare 1/2/3
+        // ALSO switch while the Search box is NOT focused (its Results
+        // list) — the state you land in when switching to Search — so the
+        // keys stay a switcher until you deliberately focus the box (Ctrl+F
+        // / Tab / click); a focused box captures digits as text so "3" is
+        // searchable. The tree's own bare 1/2/3 are handled further down.
+        if let Some(c) = match key.code {
+            KeyCode::Char(c @ ('1' | '2' | '3')) => Some(c),
+            _ => None,
+        } {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT);
+            let bare_switch = key.modifiers.is_empty() && self.search_text_unfocused();
+            if ctrl || bare_switch {
+                if ctrl {
+                    self.overlay = None;
+                    self.suspended_search = None;
+                }
+                return match c {
+                    '1' => {
+                        // Explorer is this app's own tree: dropping the search
+                        // overlay lands on it in-process.
+                        if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) || ctrl {
+                            self.overlay = None;
+                            if self.merged() {
+                                self.sidebar_state = sidebar::update_state(|state| {
+                                    state.search_active = false;
+                                });
+                            }
+                        }
+                        self.switch_to(View::Explorer)
+                    }
+                    '2' => self.switch_to(View::SourceControl),
+                    _ => {
+                        self.open_content_search(false);
+                        None
+                    }
+                };
+            }
+        }
         self.notice = None;
         if self.overlay.is_some() {
+            if matches!(self.overlay, Some(Overlay::ContentSearch { .. }))
+                && matches!(
+                    key.code,
+                    KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                )
+            {
+                self.search_snap = true;
+            }
             self.overlay_key(key);
             return None;
         }
@@ -875,6 +1038,7 @@ impl App {
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.switch_to(View::SourceControl),
+            KeyCode::Char('3') => self.open_content_search(false),
             _ => {}
         }
         None
@@ -895,8 +1059,48 @@ impl App {
         // hover title-bar buttons until the linger expires.
         self.last_mouse = Some(std::time::Instant::now());
         self.mouse_pos = Some((mouse.column, mouse.row));
-        if self.overlay.is_some() {
+        if self.overlay.is_some() && !matches!(self.overlay, Some(Overlay::ContentSearch { .. })) {
             self.overlay_mouse(mouse);
+            return None;
+        }
+        if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                let zones = self.activity;
+                if self.merged()
+                    && hits_activity_button(zones.search, zones.row, mouse.column, mouse.row)
+                {
+                    self.open_content_search(false);
+                    return None;
+                }
+                if self.merged()
+                    && hits_activity_button(zones.explorer, zones.row, mouse.column, mouse.row)
+                {
+                    self.overlay = None;
+                    self.sidebar_state =
+                        sidebar::update_state(|state| state.search_active = false);
+                    return None;
+                }
+                if self.merged()
+                    && hits_activity_button(
+                        zones.source_control,
+                        zones.row,
+                        mouse.column,
+                        mouse.row,
+                    )
+                {
+                    return self.switch_to(View::SourceControl);
+                }
+                if hits(self.gear, mouse.column, mouse.row) {
+                    self.open_settings();
+                    return None;
+                }
+                if hits_collapse_button(mouse.column, mouse.row, self.last_width, self.last_height)
+                {
+                    self.hide();
+                    return None;
+                }
+            }
+            self.search_mouse(mouse);
             return None;
         }
         match mouse.kind {
@@ -910,6 +1114,10 @@ impl App {
                 if self.merged() && mouse.row == zones.row {
                     if (zones.explorer.0..zones.explorer.1).contains(&mouse.column) {
                         return self.switch_to(View::Explorer);
+                    }
+                    if hits_activity_button(zones.search, zones.row, mouse.column, mouse.row) {
+                        self.open_content_search(false);
+                        return None;
                     }
                     if (zones.source_control.0..zones.source_control.1).contains(&mouse.column) {
                         return self.switch_to(View::SourceControl);
@@ -1081,6 +1289,8 @@ impl App {
             Activate,
             ConfirmPrompt,
             OpenQuick(PathBuf),
+            StartContentSearch,
+            OpenContent(PathBuf, usize),
             ToggleSetting(usize),
             AdjustWidth(bool),
             DeleteConfirmed(PathBuf, bool),
@@ -1179,6 +1389,224 @@ impl App {
                 }
                 _ => Cmd::Nothing,
             },
+            Some(Overlay::ContentSearch {
+                query,
+                replace,
+                include,
+                exclude,
+                hits,
+                selected,
+                truncated,
+                loading,
+                searched,
+                details_expanded,
+                focus,
+                options,
+                error,
+                dirty_since,
+            }) => {
+                let mark_dirty =
+                    |query: &str,
+                     hits: &mut std::sync::Arc<Vec<ContentHit>>,
+                     selected: &mut usize,
+                     truncated: &mut bool,
+                     loading: &mut bool,
+                     searched: &mut bool,
+                     error: &mut Option<String>,
+                     dirty_since: &mut Option<std::time::Instant>| {
+                        *hits = std::sync::Arc::new(Vec::new());
+                        *selected = 0;
+                        *truncated = false;
+                        *loading = false;
+                        *searched = false;
+                        *error = None;
+                        *dirty_since = (!query.trim().is_empty()).then(std::time::Instant::now);
+                    };
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    let toggled = match key.code {
+                        KeyCode::Char('c' | 'C') => {
+                            options.match_case = !options.match_case;
+                            true
+                        }
+                        KeyCode::Char('w' | 'W') => {
+                            options.whole_word = !options.whole_word;
+                            true
+                        }
+                        KeyCode::Char('r' | 'R') => {
+                            options.regex = !options.regex;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if toggled {
+                        mark_dirty(
+                            query,
+                            hits,
+                            selected,
+                            truncated,
+                            loading,
+                            searched,
+                            error,
+                            dirty_since,
+                        );
+                    }
+                    Cmd::Nothing
+                } else if matches!(key.code, KeyCode::Char('j' | 'J'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT)
+                {
+                    *details_expanded = !*details_expanded;
+                    if !*details_expanded
+                        && matches!(*focus, SearchFocus::Include | SearchFocus::Exclude)
+                    {
+                        *focus = SearchFocus::Query;
+                    }
+                    Cmd::Nothing
+                } else {
+                    match key.code {
+                        KeyCode::Esc => Cmd::Close,
+                        KeyCode::Tab => {
+                            *focus = match *focus {
+                                SearchFocus::Query => SearchFocus::Replace,
+                                SearchFocus::Replace if *details_expanded => SearchFocus::Include,
+                                SearchFocus::Replace => SearchFocus::Results,
+                                SearchFocus::Include => SearchFocus::Exclude,
+                                SearchFocus::Exclude => SearchFocus::Results,
+                                SearchFocus::Results => SearchFocus::Query,
+                            };
+                            Cmd::Nothing
+                        }
+                        KeyCode::BackTab => {
+                            *focus = match *focus {
+                                SearchFocus::Query => SearchFocus::Results,
+                                SearchFocus::Replace => SearchFocus::Query,
+                                SearchFocus::Include => SearchFocus::Replace,
+                                SearchFocus::Exclude => SearchFocus::Include,
+                                SearchFocus::Results if *details_expanded => SearchFocus::Exclude,
+                                SearchFocus::Results => SearchFocus::Replace,
+                            };
+                            Cmd::Nothing
+                        }
+                        KeyCode::Up if *focus == SearchFocus::Results => {
+                            *selected = selected.saturating_sub(1);
+                            Cmd::Nothing
+                        }
+                        KeyCode::Down if *focus == SearchFocus::Results => {
+                            *selected = (*selected + 1).min(hits.len().saturating_sub(1));
+                            Cmd::Nothing
+                        }
+                        KeyCode::Down if *focus != SearchFocus::Replace && !hits.is_empty() => {
+                            *focus = SearchFocus::Results;
+                            Cmd::Nothing
+                        }
+                        KeyCode::Enter if *focus == SearchFocus::Results => hits
+                            .get(*selected)
+                            .map(|hit| Cmd::OpenContent(hit.path.clone(), hit.line))
+                            .unwrap_or(Cmd::Nothing),
+                        KeyCode::Enter
+                            if matches!(
+                                *focus,
+                                SearchFocus::Query | SearchFocus::Include | SearchFocus::Exclude
+                            ) && !*loading
+                                && !query.trim().is_empty() =>
+                        {
+                            Cmd::StartContentSearch
+                        }
+                        KeyCode::Backspace if *focus == SearchFocus::Query => {
+                            query.pop();
+                            mark_dirty(
+                                query,
+                                hits,
+                                selected,
+                                truncated,
+                                loading,
+                                searched,
+                                error,
+                                dirty_since,
+                            );
+                            Cmd::Nothing
+                        }
+                        KeyCode::Backspace if *focus == SearchFocus::Replace => {
+                            replace.pop();
+                            Cmd::Nothing
+                        }
+                        KeyCode::Backspace
+                            if matches!(*focus, SearchFocus::Include | SearchFocus::Exclude) =>
+                        {
+                            if *focus == SearchFocus::Include {
+                                include.pop();
+                            } else {
+                                exclude.pop();
+                            }
+                            mark_dirty(
+                                query,
+                                hits,
+                                selected,
+                                truncated,
+                                loading,
+                                searched,
+                                error,
+                                dirty_since,
+                            );
+                            Cmd::Nothing
+                        }
+                        KeyCode::Char(c)
+                            if (!key.modifiers.contains(KeyModifiers::CONTROL)
+                                || key.modifiers.contains(KeyModifiers::ALT))
+                                && *focus == SearchFocus::Query =>
+                        {
+                            query.push(c);
+                            mark_dirty(
+                                query,
+                                hits,
+                                selected,
+                                truncated,
+                                loading,
+                                searched,
+                                error,
+                                dirty_since,
+                            );
+                            Cmd::Nothing
+                        }
+                        KeyCode::Char(c)
+                            if (!key.modifiers.contains(KeyModifiers::CONTROL)
+                                || key.modifiers.contains(KeyModifiers::ALT))
+                                && *focus == SearchFocus::Replace =>
+                        {
+                            replace.push(c);
+                            Cmd::Nothing
+                        }
+                        KeyCode::Char(c)
+                            if (!key.modifiers.contains(KeyModifiers::CONTROL)
+                                || key.modifiers.contains(KeyModifiers::ALT))
+                                && matches!(
+                                    *focus,
+                                    SearchFocus::Include | SearchFocus::Exclude
+                                ) =>
+                        {
+                            if *focus == SearchFocus::Include {
+                                include.push(c);
+                            } else {
+                                exclude.push(c);
+                            }
+                            mark_dirty(
+                                query,
+                                hits,
+                                selected,
+                                truncated,
+                                loading,
+                                searched,
+                                error,
+                                dirty_since,
+                            );
+                            Cmd::Nothing
+                        }
+                        _ => Cmd::Nothing,
+                    }
+                }
+            }
             Some(Overlay::ConfirmDelete { path, is_dir }) => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     Cmd::DeleteConfirmed(path.clone(), *is_dir)
@@ -1189,12 +1617,24 @@ impl App {
         };
         match cmd {
             Cmd::Nothing => {}
-            Cmd::Close => self.overlay = None,
+            Cmd::Close => {
+                let closing_search = matches!(self.overlay, Some(Overlay::ContentSearch { .. }));
+                // A modal opened from Search resumes it; a plain search close
+                // (Esc in the search box) has nothing parked and drops to tree.
+                self.overlay = self.suspended_search.take();
+                if closing_search && self.merged() {
+                    self.sidebar_state = sidebar::update_state(|state| state.search_active = false);
+                }
+            }
             Cmd::Activate => self.activate_menu_entry(),
             Cmd::ConfirmPrompt => self.confirm_prompt(),
             Cmd::OpenQuick(path) => {
                 self.overlay = None;
                 self.open_preview(&path);
+            }
+            Cmd::StartContentSearch => self.start_content_search(),
+            Cmd::OpenContent(path, line) => {
+                self.open_preview_at(&path, Some(line));
             }
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
@@ -1315,7 +1755,17 @@ impl App {
 
     // ---- Settings modal ----
 
+    /// Park a live Search overlay so a modal can open over it and be restored
+    /// on close, rather than clobbering it (which dropped the user back to the
+    /// tree). No-op when the current overlay isn't Search.
+    fn suspend_search_for_modal(&mut self) {
+        if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) {
+            self.suspended_search = self.overlay.take();
+        }
+    }
+
     fn open_settings(&mut self) {
+        self.suspend_search_for_modal();
         self.overlay = Some(Overlay::Settings {
             selected: 0,
             rect: Rect::default(),
@@ -1408,6 +1858,334 @@ impl App {
             truncated,
             loading,
         });
+    }
+
+    fn search_text_unfocused(&self) -> bool {
+        matches!(
+            self.overlay,
+            Some(Overlay::ContentSearch {
+                focus: SearchFocus::Results,
+                ..
+            })
+        )
+    }
+
+    /// Open the Search view. `focus_query` puts the caret in the search box
+    /// ready to type (the Ctrl+F "find" gesture); switching in via 2 / the
+    /// activity bar passes `false`, so the box is not focused and bare 1/2/3
+    /// keep switching views until the user deliberately focuses it.
+    pub fn open_content_search(&mut self, focus_query: bool) {
+        if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) {
+            return;
+        }
+        self.overlay = Some(Overlay::ContentSearch {
+            query: String::new(),
+            replace: String::new(),
+            include: String::new(),
+            exclude: String::new(),
+            hits: std::sync::Arc::new(Vec::new()),
+            selected: 0,
+            truncated: false,
+            loading: false,
+            searched: false,
+            details_expanded: false,
+            focus: if focus_query {
+                SearchFocus::Query
+            } else {
+                SearchFocus::Results
+            },
+            options: SearchOptions::default(),
+            error: None,
+            dirty_since: None,
+        });
+        self.search_scroll = 0;
+        self.search_snap = false;
+        if self.merged() {
+            self.sidebar_state = sidebar::update_state(|state| {
+                state.active = View::Explorer;
+                state.search_active = true;
+            });
+        }
+    }
+
+    fn start_content_search_if_due(&mut self) {
+        let due = matches!(
+            self.overlay,
+            Some(Overlay::ContentSearch {
+                dirty_since: Some(started),
+                ..
+            }) if started.elapsed() >= std::time::Duration::from_millis(300)
+        );
+        if due && self.content_search_rx.is_none() {
+            self.start_content_search();
+        }
+    }
+
+    fn search_mouse(&mut self, mouse: MouseEvent) {
+        enum Cmd {
+            Nothing,
+            Search,
+            Open(PathBuf, usize),
+            Scroll(isize),
+        }
+        let zones = self.search_zones;
+        let clicked_result = self
+            .search_result_rows
+            .iter()
+            .find(|(area, _)| hits(*area, mouse.column, mouse.row))
+            .map(|(_, index)| *index);
+        let Some(Overlay::ContentSearch {
+            query,
+            replace,
+            include,
+            exclude,
+            hits: search_hits,
+            selected,
+            truncated,
+            loading,
+            searched,
+            details_expanded,
+            focus,
+            options,
+            error,
+            dirty_since,
+            ..
+        }) = self.overlay.as_mut()
+        else {
+            return;
+        };
+        let mut dirty = false;
+        let cmd = match mouse.kind {
+            MouseEventKind::ScrollUp => Cmd::Scroll(-3),
+            MouseEventKind::ScrollDown => Cmd::Scroll(3),
+            MouseEventKind::Down(MouseButton::Left)
+                if hits(zones.refresh, mouse.column, mouse.row) =>
+            {
+                Cmd::Search
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if hits(zones.clear, mouse.column, mouse.row) =>
+            {
+                query.clear();
+                replace.clear();
+                include.clear();
+                exclude.clear();
+                *search_hits = std::sync::Arc::new(Vec::new());
+                *selected = 0;
+                *truncated = false;
+                *loading = false;
+                *searched = false;
+                *error = None;
+                *dirty_since = None;
+                *focus = SearchFocus::Query;
+                Cmd::Nothing
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if hits(zones.details, mouse.column, mouse.row) =>
+            {
+                *details_expanded = !*details_expanded;
+                if !*details_expanded
+                    && matches!(*focus, SearchFocus::Include | SearchFocus::Exclude)
+                {
+                    *focus = SearchFocus::Query;
+                }
+                Cmd::Nothing
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if hits(zones.match_case, mouse.column, mouse.row) =>
+            {
+                options.match_case = !options.match_case;
+                dirty = true;
+                Cmd::Nothing
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if hits(zones.whole_word, mouse.column, mouse.row) =>
+            {
+                options.whole_word = !options.whole_word;
+                dirty = true;
+                Cmd::Nothing
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if hits(zones.regex, mouse.column, mouse.row) =>
+            {
+                options.regex = !options.regex;
+                dirty = true;
+                Cmd::Nothing
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if hits(zones.query, mouse.column, mouse.row) =>
+            {
+                *focus = SearchFocus::Query;
+                Cmd::Nothing
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if hits(zones.replace, mouse.column, mouse.row) =>
+            {
+                *focus = SearchFocus::Replace;
+                Cmd::Nothing
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if *details_expanded && hits(zones.include, mouse.column, mouse.row) =>
+            {
+                *focus = SearchFocus::Include;
+                Cmd::Nothing
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if *details_expanded && hits(zones.exclude, mouse.column, mouse.row) =>
+            {
+                *focus = SearchFocus::Exclude;
+                Cmd::Nothing
+            }
+            MouseEventKind::Down(MouseButton::Left) => clicked_result
+                .and_then(|index| {
+                    *selected = index;
+                    *focus = SearchFocus::Results;
+                    search_hits
+                        .get(index)
+                        .map(|hit| Cmd::Open(hit.path.clone(), hit.line))
+                })
+                .unwrap_or(Cmd::Nothing),
+            _ => Cmd::Nothing,
+        };
+        if dirty {
+            *search_hits = std::sync::Arc::new(Vec::new());
+            *selected = 0;
+            *truncated = false;
+            *loading = false;
+            *searched = false;
+            *error = None;
+            *dirty_since = (!query.trim().is_empty()).then(std::time::Instant::now);
+        }
+        match cmd {
+            Cmd::Nothing => {}
+            Cmd::Search => self.start_content_search(),
+            Cmd::Open(path, line) => self.open_preview_at(&path, Some(line)),
+            Cmd::Scroll(delta) => {
+                self.search_snap = false;
+                self.search_scroll = if delta < 0 {
+                    self.search_scroll.saturating_sub(delta.unsigned_abs())
+                } else {
+                    self.search_scroll.saturating_add(delta as usize)
+                };
+            }
+        }
+    }
+
+    fn start_content_search(&mut self) {
+        let Some(Overlay::ContentSearch {
+            query,
+            include,
+            exclude,
+            hits,
+            selected,
+            truncated,
+            loading,
+            searched,
+            options,
+            error,
+            dirty_since,
+            ..
+        }) = self.overlay.as_mut()
+        else {
+            return;
+        };
+        let query = query.clone();
+        let include = include.clone();
+        let exclude = exclude.clone();
+        if query.is_empty() || self.content_search_rx.is_some() {
+            return;
+        }
+        *hits = std::sync::Arc::new(Vec::new());
+        *selected = 0;
+        *truncated = false;
+        *loading = true;
+        *searched = true;
+        *error = None;
+        *dirty_since = None;
+        self.search_scroll = 0;
+        self.search_snap = true;
+        let options = *options;
+        let root = self.tree.root_path();
+        let show_hidden = self.tree.show_hidden;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = collect_content_hits(
+                &root,
+                show_hidden,
+                &query,
+                &include,
+                &exclude,
+                options,
+                CONTENT_SEARCH_MATCH_LIMIT,
+            );
+            let (hits, truncated, error) = match result {
+                Ok((hits, truncated)) => (hits, truncated, None),
+                Err(error) => (Vec::new(), false, Some(error)),
+            };
+            let _ = tx.send(ContentSearchResult {
+                root,
+                show_hidden,
+                query,
+                include,
+                exclude,
+                options,
+                hits: std::sync::Arc::new(hits),
+                truncated,
+                error,
+            });
+        });
+        self.content_search_rx = Some(rx);
+    }
+
+    fn collect_content_search(&mut self) {
+        let result = self
+            .content_search_rx
+            .as_ref()
+            .map(std::sync::mpsc::Receiver::try_recv);
+        match result {
+            Some(Ok(result)) => {
+                self.content_search_rx = None;
+                if result.root != self.tree.root_path()
+                    || result.show_hidden != self.tree.show_hidden
+                {
+                    return;
+                }
+                if let Some(Overlay::ContentSearch {
+                    query,
+                    include,
+                    exclude,
+                    hits,
+                    selected,
+                    truncated,
+                    loading,
+                    searched,
+                    options,
+                    error,
+                    dirty_since,
+                    ..
+                }) = self.overlay.as_mut()
+                    && *query == result.query
+                    && *include == result.include
+                    && *exclude == result.exclude
+                    && *options == result.options
+                {
+                    *hits = result.hits;
+                    *selected = 0;
+                    *truncated = result.truncated;
+                    *loading = false;
+                    *searched = true;
+                    *error = result.error;
+                    *dirty_since = None;
+                }
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.content_search_rx = None;
+                if let Some(Overlay::ContentSearch { loading, .. }) = self.overlay.as_mut() {
+                    *loading = false;
+                }
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
+        }
     }
 
     /// The modal's rows for the current state.
@@ -2091,12 +2869,16 @@ impl App {
             frame.render_widget(Clear, area);
             let cx = area.x;
             let w = area.width;
-            let is_exp = self.sidebar_state.active == View::Explorer;
+            let is_search = self.sidebar_state.search_active;
+            let is_exp = self.sidebar_state.active == View::Explorer && !is_search;
+            let is_git = self.sidebar_state.active == View::SourceControl && !is_search;
             let e_line = if is_exp { Line::from(vec!["1 ".dim(), "●".green()]) } else { Line::from(vec!["1 ".dim(), "○".dim()]) };
-            let s_line = if !is_exp { Line::from(vec!["2 ".dim(), "●".green()]) } else { Line::from(vec!["2 ".dim(), "○".dim()]) };
-            if area.height > 2 {
+            let g_line = if is_git { Line::from(vec!["2 ".dim(), "●".green()]) } else { Line::from(vec!["2 ".dim(), "○".dim()]) };
+            let s_line = if is_search { Line::from(vec!["3 ".dim(), "●".green()]) } else { Line::from(vec!["3 ".dim(), "○".dim()]) };
+            if area.height > 3 {
                 frame.render_widget(Paragraph::new(e_line).alignment(Alignment::Center), Rect{ x: cx, y: area.y+1, width: w, height: 1 });
-                frame.render_widget(Paragraph::new(s_line).alignment(Alignment::Center), Rect{ x: cx, y: area.y+2, width: w, height: 1 });
+                frame.render_widget(Paragraph::new(g_line).alignment(Alignment::Center), Rect{ x: cx, y: area.y+2, width: w, height: 1 });
+                frame.render_widget(Paragraph::new(s_line).alignment(Alignment::Center), Rect{ x: cx, y: area.y+3, width: w, height: 1 });
             }
             if area.height > 1 {
                 let by = area.y + area.height.saturating_sub(1);
@@ -2124,51 +2906,63 @@ impl App {
         if self.merged() {
             self.draw_activity_bar(frame, activity);
         }
-        self.draw_header(frame, header);
-
-        if self.rows.is_empty() {
-            frame.render_widget(Paragraph::new("  (empty)".dim().italic()), body);
+        let search_active = matches!(self.overlay, Some(Overlay::ContentSearch { .. }));
+        if search_active {
+            let search_area = Rect::new(
+                header.x,
+                header.y,
+                header.width,
+                header.height.saturating_add(body.height),
+            );
+            self.draw_content_search(frame, search_area);
+            self.body = BodyGeom::default();
         } else {
-            let h = (body.height as usize).max(1);
-            self.scroll = self.scroll.min(self.rows.len().saturating_sub(h));
-            if self.snap {
-                if let Some(sel) = self.selected {
-                    if sel < self.scroll {
-                        self.scroll = sel;
-                    } else if sel >= self.scroll + h {
-                        self.scroll = sel + 1 - h;
+            self.draw_header(frame, header);
+
+            if self.rows.is_empty() {
+                frame.render_widget(Paragraph::new("  (empty)".dim().italic()), body);
+            } else {
+                let h = (body.height as usize).max(1);
+                self.scroll = self.scroll.min(self.rows.len().saturating_sub(h));
+                if self.snap {
+                    if let Some(sel) = self.selected {
+                        if sel < self.scroll {
+                            self.scroll = sel;
+                        } else if sel >= self.scroll + h {
+                            self.scroll = sel + 1 - h;
+                        }
                     }
+                    self.snap = false;
                 }
-                self.snap = false;
+                let theme = self.theme;
+                let hovered = self.hovered;
+                let selected = self.selected;
+                let items: Vec<ListItem> = self
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .skip(self.scroll)
+                    .take(h)
+                    .map(|(i, r)| {
+                        row_item(
+                            r,
+                            theme,
+                            hovered == Some(i),
+                            selected == Some(i),
+                            self.row_deco(r),
+                            body.width,
+                        )
+                    })
+                    .collect();
+                frame.render_widget(List::new(items), body);
+                draw_scrollbar(frame, body, self.rows.len(), h, self.scroll);
             }
-            let theme = self.theme;
-            let hovered = self.hovered;
-            let selected = self.selected;
-            let items: Vec<ListItem> = self
-                .rows
-                .iter()
-                .enumerate()
-                .skip(self.scroll)
-                .take(h)
-                .map(|(i, r)| {
-                    row_item(
-                        r,
-                        theme,
-                        hovered == Some(i),
-                        selected == Some(i),
-                        self.row_deco(r),
-                        body.width,
-                    )
-                })
-                .collect();
-            frame.render_widget(List::new(items), body);
-            draw_scrollbar(frame, body, self.rows.len(), h, self.scroll);
+            self.body = BodyGeom {
+                top: body.y,
+                height: body.height,
+                offset: self.scroll,
+            };
         }
-        self.body = BodyGeom {
-            top: body.y,
-            height: body.height,
-            offset: self.scroll,
-        };
 
         // Collapse button at the bottom-right of the LAST footer line,
         // mirroring herdr's own sidebar. hits_collapse_button targets the
@@ -2181,10 +2975,6 @@ impl App {
         );
         let [_, footer_button] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(last_line);
-        frame.render_widget(
-            Paragraph::new("«".bold().fg(palette().header_accent)).alignment(Alignment::Center),
-            footer_button,
-        );
         let footer_lines: Vec<Line> = if let Some((msg, color)) = self.footer_message() {
             wrap_footer_message(&msg, footer.width, 4)
                 .into_iter()
@@ -2220,12 +3010,26 @@ impl App {
                     }
                     vec![Line::from(spans)]
                 }
+                Some(Overlay::ContentSearch { .. }) => {
+                    vec![Line::from(vec![Span::styled(
+                        " esc close · tab field · ⏎ search/open",
+                        Style::default().dim(),
+                    )])]
+                }
                 _ if self.show_hotkeys() => wrap_hints(&self.hints(), frame.area().width, 3),
                 _ => Vec::new(),
             }
         };
         let footer_empty = footer_lines.is_empty();
-        frame.render_widget(Paragraph::new(footer_lines), footer);
+        // Footer text keeps clear of the collapse button's cells (same
+        // geometry as the menu-hint fallback below).
+        let footer_text = Rect::new(
+            footer.x,
+            footer.y,
+            footer.width.saturating_sub(3),
+            footer.height,
+        );
+        frame.render_widget(Paragraph::new(footer_lines), footer_text);
         if footer_empty {
             let hint_area = Rect::new(
                 last_line.x,
@@ -2238,6 +3042,12 @@ impl App {
                 hint_area,
             );
         }
+        // Last: the collapse button owns its cells — footer text (notices,
+        // the search hint) must never paint over it.
+        frame.render_widget(
+            Paragraph::new("«".bold().fg(palette().header_accent)).alignment(Alignment::Center),
+            footer_button,
+        );
 
         match self.overlay {
             Some(Overlay::Menu { .. }) => self.draw_menu(frame),
@@ -2325,13 +3135,14 @@ impl App {
             (".", "dotfiles"),
             ("c", "folder"),
             ("ctrl+p", "find"),
+            ("ctrl+f", "search"),
             ("m", "menu"),
             ("s", "settings"),
             ("b", "hide"),
             ("q", "quit"),
         ];
         if self.merged() {
-            hints.extend([("1", "files"), ("2", "git")]);
+            hints.extend([("1", "files"), ("2", "git"), ("3", "search")]);
         }
         hints
     }
@@ -2378,14 +3189,8 @@ impl App {
         let outer_top = area.y;
         let outer_bottom = area.y + 2;
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let (exp_icon, git_icon) = activity_icons(self.theme);
-        let active = |on: bool| {
-            if on {
-                selection_style(true)
-            } else {
-                Style::default().dim()
-            }
-        };
+        let (exp_icon, search_icon, git_icon) = activity_icons(self.theme);
+        let search_active = matches!(self.overlay, Some(Overlay::ContentSearch { .. }));
         // Both FA glyphs (folder, code-fork) render two cells wide in the
         // non-Mono Nerd Font; reserve the second cell in each chip so the
         // highlights are equal-sized with centered icons.
@@ -2394,11 +3199,13 @@ impl App {
         } else {
             ""
         };
-        let spans = [
+        let mut spans = [
             Span::raw(" "),
-            Span::styled(format!(" {exp_icon}{slack} "), active(true)),
+            Span::raw(format!(" {exp_icon}{slack} ")),
             Span::raw(" "),
-            Span::styled(format!(" {git_icon}{slack} "), active(false)),
+            Span::raw(format!(" {git_icon}{slack} ")),
+            Span::raw(" "),
+            Span::raw(format!(" {search_icon}{slack} ")),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -2412,17 +3219,41 @@ impl App {
             row: area.y,
             explorer: bounds[1],
             source_control: bounds[3],
+            search: bounds[5],
         };
-        // Symmetric half-block caps: a 2-cell button with the icon in its
-        // vertical center.
-        let (chip_start, chip_end) = bounds[1];
-        let chip_w = chip_end.saturating_sub(chip_start);
-        let cap = |glyph: &str| {
-            Paragraph::new(glyph.repeat(usize::from(chip_w)))
-                .style(Style::default().fg(palette().selection_bg))
+        let hovered = |bounds| {
+            self.mouse_pos
+                .is_some_and(|(x, y)| hits_activity_button(bounds, area.y, x, y))
         };
-        frame.render_widget(cap("▄"), Rect::new(chip_start, outer_top, chip_w, 1));
-        frame.render_widget(cap("▀"), Rect::new(chip_start, outer_bottom, chip_w, 1));
+        let explorer_hovered = hovered(bounds[1]);
+        let git_hovered = hovered(bounds[3]);
+        let search_hovered = hovered(bounds[5]);
+        spans[1].style = activity_button_style(!search_active, explorer_hovered);
+        spans[3].style = activity_button_style(false, git_hovered);
+        spans[5].style = activity_button_style(search_active, search_hovered);
+        let (chip_start, chip_end) = if search_active { bounds[5] } else { bounds[1] };
+        draw_activity_caps(
+            frame,
+            (chip_start, chip_end),
+            outer_top,
+            outer_bottom,
+            palette().selection_bg,
+        );
+        for (active, is_hovered, button_bounds) in [
+            (!search_active, explorer_hovered, bounds[1]),
+            (false, git_hovered, bounds[3]),
+            (search_active, search_hovered, bounds[5]),
+        ] {
+            if !active && is_hovered {
+                draw_activity_caps(
+                    frame,
+                    button_bounds,
+                    outer_top,
+                    outer_bottom,
+                    palette().hover_bg,
+                );
+            }
+        }
         let gear = Span::styled(
             format!(" {} ", gear_icon(self.theme)),
             Style::default().dim(),
@@ -2584,9 +3415,708 @@ impl App {
             );
         }
     }
+    fn draw_content_search(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(Overlay::ContentSearch {
+            query,
+            replace,
+            include,
+            exclude,
+            hits,
+            selected,
+            truncated,
+            loading,
+            searched,
+            details_expanded,
+            focus,
+            options,
+            error,
+            ..
+        }) = self.overlay.as_ref()
+        else {
+            return;
+        };
+        let query = query.clone();
+        let replace = replace.clone();
+        let include = include.clone();
+        let exclude = exclude.clone();
+        let hits = std::sync::Arc::clone(hits);
+        let selected = *selected;
+        let truncated = *truncated;
+        let loading = *loading;
+        let searched = *searched;
+        let details_expanded = *details_expanded;
+        let focus = *focus;
+        let options = *options;
+        let error = error.clone();
+        let has_error = error.is_some();
+
+        self.search_zones = SearchZones::default();
+        self.search_result_rows.clear();
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+
+        let title = Rect::new(area.x, area.y, area.width, 1);
+        let toolbar_width = 9.min(area.width);
+        let toolbar_x = area.x + area.width.saturating_sub(toolbar_width);
+        let (refresh_icon, clear_icon, details_icon) = search_toolbar_icons(self.theme);
+        frame.render_widget(Paragraph::new(" Search").bold(), title);
+        self.search_zones.refresh = Rect::new(toolbar_x, title.y, 3.min(toolbar_width), 1);
+        self.search_zones.clear = Rect::new(toolbar_x.saturating_add(3), title.y, 3, 1);
+        self.search_zones.details = Rect::new(toolbar_x.saturating_add(6), title.y, 3, 1);
+        let hovered = |rect: Rect| {
+            self.mouse_pos.is_some_and(|(x, y)| {
+                x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
+            })
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!(" {refresh_icon} "),
+                    chrome_button_style(hovered(self.search_zones.refresh)),
+                ),
+                Span::styled(
+                    format!(" {clear_icon} "),
+                    chrome_button_style(hovered(self.search_zones.clear)),
+                ),
+                Span::styled(
+                    format!(" {details_icon} "),
+                    chrome_button_style(hovered(self.search_zones.details)),
+                ),
+            ]))
+            .alignment(Alignment::Right),
+            Rect::new(toolbar_x, title.y, toolbar_width, 1),
+        );
+
+        let query_y = area.y.saturating_add(2);
+        let query_box = Rect::new(
+            area.x.saturating_add(2),
+            query_y,
+            area.width.saturating_sub(3),
+            3,
+        );
+        let option_width = query_box.width.min(9);
+        let option_x = query_box.x
+            + query_box
+                .width
+                .saturating_sub(option_width.saturating_add(1));
+        let query_border = if focus == SearchFocus::Query {
+            Style::default().fg(palette().accent_focus)
+        } else {
+            Style::default().dim()
+        };
+        frame.render_widget(Block::bordered().border_style(query_border), query_box);
+        let query_inner = Rect::new(
+            query_box.x.saturating_add(1),
+            query_box.y.saturating_add(1),
+            query_box
+                .width
+                .saturating_sub(option_width.saturating_add(2)),
+            1,
+        );
+        self.search_zones.query = query_inner;
+        frame.render_widget(
+            Paragraph::new(search_input_line(
+                &query,
+                "Search",
+                focus == SearchFocus::Query,
+                query_inner.width,
+            )),
+            query_inner,
+        );
+
+        let option_style = |active: bool| {
+            if active {
+                selection_style(true)
+            } else {
+                Style::default().dim()
+            }
+        };
+        let options_area = Rect::new(option_x, query_box.y.saturating_add(1), option_width, 1);
+        let option_spans = [
+            Span::styled("Aa ", option_style(options.match_case)),
+            Span::styled("ab ", option_style(options.whole_word)),
+            Span::styled(".* ", option_style(options.regex)),
+        ];
+        let mut option_cursor = options_area.x;
+        let mut option_bounds = Vec::new();
+        for span in &option_spans {
+            let width = span.width() as u16;
+            option_bounds.push(Rect::new(option_cursor, options_area.y, width, 1));
+            option_cursor = option_cursor.saturating_add(width);
+        }
+        self.search_zones.match_case = option_bounds[0];
+        self.search_zones.whole_word = option_bounds[1];
+        self.search_zones.regex = option_bounds[2];
+        frame.render_widget(
+            Paragraph::new(Line::from(option_spans.to_vec())),
+            options_area,
+        );
+
+        let replace_y = query_box.y.saturating_add(query_box.height);
+        let replace_box = Rect::new(
+            area.x.saturating_add(2),
+            replace_y,
+            area.width.saturating_sub(3),
+            3,
+        );
+        let replace_border = if focus == SearchFocus::Replace {
+            Style::default().fg(palette().accent_focus)
+        } else {
+            Style::default().dim()
+        };
+        frame.render_widget(Block::bordered().border_style(replace_border), replace_box);
+        let replace_inner = Rect::new(
+            replace_box.x.saturating_add(1),
+            replace_box.y.saturating_add(1),
+            replace_box.width.saturating_sub(2),
+            1,
+        );
+        self.search_zones.replace = replace_inner;
+        frame.render_widget(
+            Paragraph::new(search_input_line(
+                &replace,
+                "Replace",
+                focus == SearchFocus::Replace,
+                replace_inner.width,
+            )),
+            replace_inner,
+        );
+        let mut results_y = replace_box
+            .y
+            .saturating_add(replace_box.height)
+            .saturating_add(1);
+
+        if details_expanded {
+            let include_label = Rect::new(
+                area.x.saturating_add(2),
+                results_y,
+                area.width.saturating_sub(3),
+                1,
+            );
+            frame.render_widget(Paragraph::new("files to include").dim(), include_label);
+            let include_box = Rect::new(
+                area.x.saturating_add(2),
+                results_y.saturating_add(1),
+                area.width.saturating_sub(3),
+                3,
+            );
+            frame.render_widget(
+                Block::bordered().border_style(if focus == SearchFocus::Include {
+                    Style::default().fg(palette().accent_focus)
+                } else {
+                    Style::default().dim()
+                }),
+                include_box,
+            );
+            let include_inner = Rect::new(
+                include_box.x.saturating_add(1),
+                include_box.y.saturating_add(1),
+                include_box.width.saturating_sub(2),
+                1,
+            );
+            self.search_zones.include = include_inner;
+            frame.render_widget(
+                Paragraph::new(search_input_line(
+                    &include,
+                    "e.g. *.ts, src/**/include",
+                    focus == SearchFocus::Include,
+                    include_inner.width,
+                )),
+                include_inner,
+            );
+
+            let exclude_label_y = include_box.y.saturating_add(include_box.height);
+            let exclude_label = Rect::new(
+                area.x.saturating_add(2),
+                exclude_label_y,
+                area.width.saturating_sub(3),
+                1,
+            );
+            frame.render_widget(Paragraph::new("files to exclude").dim(), exclude_label);
+            let exclude_box = Rect::new(
+                area.x.saturating_add(2),
+                exclude_label_y.saturating_add(1),
+                area.width.saturating_sub(3),
+                3,
+            );
+            frame.render_widget(
+                Block::bordered().border_style(if focus == SearchFocus::Exclude {
+                    Style::default().fg(palette().accent_focus)
+                } else {
+                    Style::default().dim()
+                }),
+                exclude_box,
+            );
+            let exclude_inner = Rect::new(
+                exclude_box.x.saturating_add(1),
+                exclude_box.y.saturating_add(1),
+                exclude_box.width.saturating_sub(2),
+                1,
+            );
+            self.search_zones.exclude = exclude_inner;
+            frame.render_widget(
+                Paragraph::new(search_input_line(
+                    &exclude,
+                    "e.g. node_modules, **/*.min.js",
+                    focus == SearchFocus::Exclude,
+                    exclude_inner.width,
+                )),
+                exclude_inner,
+            );
+            results_y = exclude_box
+                .y
+                .saturating_add(exclude_box.height)
+                .saturating_add(1);
+        }
+
+        let status = if let Some(error) = error {
+            Some(error)
+        } else if loading {
+            Some("Searching…".to_string())
+        } else if !searched {
+            None
+        } else if hits.is_empty() {
+            Some("No results found".to_string())
+        } else if truncated {
+            Some(format!("{} results · result limit reached", hits.len()))
+        } else {
+            Some(format!("{} results", hits.len()))
+        };
+        if results_y >= area.y.saturating_add(area.height) {
+            return;
+        }
+        let list_y = if let Some(status) = status {
+            let status_area = Rect::new(
+                area.x.saturating_add(1),
+                results_y,
+                area.width.saturating_sub(2),
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(status).style(if has_error {
+                    Style::default().fg(palette().deleted)
+                } else {
+                    Style::default().dim()
+                }),
+                status_area,
+            );
+            results_y.saturating_add(1)
+        } else {
+            results_y
+        };
+        let list_area = Rect::new(
+            area.x,
+            list_y,
+            area.width,
+            area.y.saturating_add(area.height).saturating_sub(list_y),
+        );
+        let mut rows: Vec<(Option<usize>, Line<'static>)> = Vec::new();
+        let mut hit_index = 0;
+        while hit_index < hits.len() {
+            let label = &hits[hit_index].label;
+            let mut end = hit_index + 1;
+            while end < hits.len() && hits[end].label == *label {
+                end += 1;
+            }
+            let count = end - hit_index;
+            let count_text = format!(" {count}");
+            let label_width =
+                usize::from(list_area.width).saturating_sub(2 + Span::raw(&count_text).width());
+            rows.push((
+                None,
+                Line::from(vec![
+                    Span::styled("⌄ ", Style::default().dim()),
+                    Span::styled(
+                        truncate_path_tail(label, label_width),
+                        Style::default().bold(),
+                    ),
+                    Span::styled(count_text, Style::default().dim()),
+                ]),
+            ));
+            for index in hit_index..end {
+                let hit = &hits[index];
+                let prefix = format!("   {}: ", hit.line);
+                let context_width =
+                    usize::from(list_area.width).saturating_sub(Span::raw(&prefix).width());
+                let mut spans = vec![Span::styled(
+                    prefix,
+                    Style::default().fg(palette().accent_focus),
+                )];
+                spans.extend(highlighted_search_context(
+                    &hit.context,
+                    &hit.matches,
+                    context_width,
+                    Style::default().fg(palette().header_accent).bold(),
+                ));
+                rows.push((Some(index), Line::from(spans)));
+            }
+            hit_index = end;
+        }
+        let selected_row = rows
+            .iter()
+            .position(|(index, _)| *index == Some(selected))
+            .unwrap_or(0);
+        let viewport = usize::from(list_area.height);
+        let max_start = rows.len().saturating_sub(viewport);
+        let mut start = if self.search_snap {
+            selected_row.saturating_sub(viewport / 2).min(max_start)
+        } else {
+            self.search_scroll.min(max_start)
+        };
+        if self.search_snap {
+            while start > 0 && rows[start].0.is_some() {
+                start -= 1;
+            }
+        }
+        self.search_scroll = start;
+        self.search_snap = false;
+        for (row_offset, (index, line)) in rows.into_iter().skip(start).take(viewport).enumerate() {
+            let row_area = Rect::new(
+                list_area.x,
+                list_area.y + row_offset as u16,
+                list_area.width,
+                1,
+            );
+            if let Some(index) = index {
+                self.search_result_rows.push((row_area, index));
+                frame.render_widget(
+                    Paragraph::new(line).style(if index == selected {
+                        selection_style(focus == SearchFocus::Results)
+                    } else {
+                        Style::default()
+                    }),
+                    row_area,
+                );
+            } else {
+                frame.render_widget(Paragraph::new(line), row_area);
+            }
+        }
+    }
+}
+
+fn search_input_line(value: &str, placeholder: &str, focused: bool, width: u16) -> Line<'static> {
+    let available = usize::from(width).saturating_sub(usize::from(focused));
+    let mut spans = if value.is_empty() && !focused {
+        vec![Span::styled(
+            truncate_to(placeholder.to_string(), available),
+            Style::default().dim(),
+        )]
+    } else if value.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::raw(input_tail(value, available))]
+    };
+    if focused {
+        spans.push(Span::raw("█"));
+    }
+    Line::from(spans)
+}
+
+fn search_toolbar_icons(theme: IconTheme) -> (&'static str, &'static str, &'static str) {
+    match theme {
+        IconTheme::Material => (
+            title_action_icon(theme, TitleAction::Refresh),
+            "\u{eabf}",
+            "\u{ea7c}",
+        ),
+        IconTheme::Emoji => (title_action_icon(theme, TitleAction::Refresh), "×", "⋯"),
+    }
+}
+
+fn highlighted_search_context(
+    context: &str,
+    matches: &[(usize, usize)],
+    max_width: usize,
+    match_style: Style,
+) -> Vec<Span<'static>> {
+    let context_width = Span::raw(context).width();
+    let (visible_end, truncated) = if context_width <= max_width {
+        (context.len(), false)
+    } else if max_width < 2 {
+        (0, false)
+    } else {
+        let mut width = 0;
+        let mut end = 0;
+        for (index, character) in context.char_indices() {
+            let character_width = character.width().unwrap_or(0);
+            if width + character_width + 1 > max_width {
+                break;
+            }
+            width += character_width;
+            end = index + character.len_utf8();
+        }
+        (end, true)
+    };
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for &(start, end) in matches {
+        if start >= visible_end {
+            break;
+        }
+        let start = start.max(cursor);
+        let end = end.min(visible_end);
+        if start >= end {
+            continue;
+        }
+        if start > cursor {
+            spans.push(Span::raw(context[cursor..start].to_string()));
+        }
+        spans.push(Span::styled(context[start..end].to_string(), match_style));
+        cursor = end;
+    }
+    if cursor < visible_end {
+        spans.push(Span::raw(context[cursor..visible_end].to_string()));
+    }
+    if truncated {
+        spans.push(Span::raw("…"));
+    }
+    spans
 }
 
 const QUICK_OPEN_FILE_LIMIT: usize = 20_000;
+const CONTENT_SEARCH_MATCH_LIMIT: usize = 1_000;
+const CONTENT_SEARCH_FILE_LIMIT: usize = 20_000;
+const CONTENT_SEARCH_MAX_BYTES: u64 = 1024 * 1024;
+
+fn collect_content_hits(
+    root: &Path,
+    show_hidden: bool,
+    query: &str,
+    include: &str,
+    exclude: &str,
+    options: SearchOptions,
+    limit: usize,
+) -> Result<(Vec<ContentHit>, bool), String> {
+    if query.is_empty() || limit == 0 {
+        return Ok((Vec::new(), false));
+    }
+    let pattern = if options.regex {
+        let pattern = if options.whole_word {
+            format!(r"\b(?:{query})\b")
+        } else {
+            query.to_string()
+        };
+        Some(
+            RegexBuilder::new(&pattern)
+                .case_insensitive(!options.match_case)
+                .build()
+                .map_err(|error| format!("Invalid regular expression: {error}"))?,
+        )
+    } else {
+        None
+    };
+    let includes = build_search_globs(include, "include")?;
+    let excludes = build_search_globs(exclude, "exclude")?;
+    let (files, file_limit_reached) =
+        collect_quick_files(root, show_hidden, CONTENT_SEARCH_FILE_LIMIT);
+    let mut hits = Vec::new();
+    for file in files {
+        if includes
+            .as_ref()
+            .is_some_and(|patterns| !patterns.is_match(&file.label))
+            || excludes
+                .as_ref()
+                .is_some_and(|patterns| patterns.is_match(&file.label))
+        {
+            continue;
+        }
+        if std::fs::metadata(&file.path)
+            .map(|metadata| metadata.len() > CONTENT_SEARCH_MAX_BYTES)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&file.path) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        for (index, line) in text.lines().enumerate() {
+            let ranges = content_line_match_ranges(line, query, options, pattern.as_ref());
+            let matched = pattern
+                .as_ref()
+                .is_some_and(|pattern| pattern.is_match(line))
+                || !ranges.is_empty();
+            if !matched {
+                continue;
+            }
+            let (context, matches) = content_hit_context(line, &ranges);
+            hits.push(ContentHit {
+                path: file.path.clone(),
+                label: file.label.clone(),
+                line: index + 1,
+                context,
+                matches,
+            });
+            if hits.len() >= limit {
+                return Ok((hits, true));
+            }
+        }
+    }
+    Ok((hits, file_limit_reached))
+}
+
+fn build_search_globs(raw: &str, label: &str) -> Result<Option<GlobSet>, String> {
+    let patterns = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .collect::<Vec<_>>();
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob =
+            Glob::new(pattern).map_err(|error| format!("Invalid {label} pattern: {error}"))?;
+        builder.add(glob);
+        if !pattern.contains(['*', '?', '[', '{']) {
+            let directory = pattern.trim_end_matches(['/', '\\']);
+            let descendant = format!("{directory}/**");
+            builder.add(
+                Glob::new(&descendant)
+                    .map_err(|error| format!("Invalid {label} pattern: {error}"))?,
+            );
+            if !directory.contains(['/', '\\']) {
+                let nested_descendant = format!("**/{directory}/**");
+                builder.add(
+                    Glob::new(&nested_descendant)
+                        .map_err(|error| format!("Invalid {label} pattern: {error}"))?,
+                );
+            }
+        }
+    }
+    builder
+        .build()
+        .map(Some)
+        .map_err(|error| format!("Invalid {label} pattern: {error}"))
+}
+
+#[cfg(test)]
+fn content_line_matches(
+    line: &str,
+    query: &str,
+    options: SearchOptions,
+    pattern: Option<&Regex>,
+) -> bool {
+    if let Some(pattern) = pattern {
+        return pattern.is_match(line);
+    }
+    !literal_match_ranges(line, query, options).is_empty()
+}
+
+fn content_line_match_ranges(
+    line: &str,
+    query: &str,
+    options: SearchOptions,
+    pattern: Option<&Regex>,
+) -> Vec<(usize, usize)> {
+    if let Some(pattern) = pattern {
+        return pattern
+            .find_iter(line)
+            .filter(|found| !found.is_empty())
+            .map(|found| (found.start(), found.end()))
+            .collect();
+    }
+    literal_match_ranges(line, query, options)
+}
+
+fn literal_match_ranges(line: &str, query: &str, options: SearchOptions) -> Vec<(usize, usize)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    if options.match_case {
+        return line
+            .match_indices(query)
+            .filter_map(|(start, matched)| {
+                let end = start + matched.len();
+                word_boundary_matches(line, start, end, options.whole_word).then_some((start, end))
+            })
+            .collect();
+    }
+
+    let lowered = line.to_lowercase();
+    let mut source_by_lowered_character = Vec::new();
+    for (source_start, character) in line.char_indices() {
+        let source_range = (source_start, source_start + character.len_utf8());
+        source_by_lowered_character.extend(std::iter::repeat_n(
+            source_range,
+            character.to_lowercase().count(),
+        ));
+    }
+    let mut lowered_boundaries = lowered
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    lowered_boundaries.push(lowered.len());
+    if source_by_lowered_character.len() + 1 != lowered_boundaries.len() {
+        return Vec::new();
+    }
+    let needle = query.to_lowercase();
+    let mut ranges = Vec::new();
+    for (lowered_start, matched) in lowered.match_indices(&needle) {
+        let lowered_end = lowered_start + matched.len();
+        if !word_boundary_matches(&lowered, lowered_start, lowered_end, options.whole_word) {
+            continue;
+        }
+        let Ok(first) = lowered_boundaries.binary_search(&lowered_start) else {
+            continue;
+        };
+        let Ok(after_last) = lowered_boundaries.binary_search(&lowered_end) else {
+            continue;
+        };
+        if first >= after_last {
+            continue;
+        }
+        let range = (
+            source_by_lowered_character[first].0,
+            source_by_lowered_character[after_last - 1].1,
+        );
+        if ranges.last() != Some(&range) {
+            ranges.push(range);
+        }
+    }
+    ranges
+}
+
+fn word_boundary_matches(haystack: &str, start: usize, end: usize, whole_word: bool) -> bool {
+    if !whole_word {
+        return true;
+    }
+    let before = haystack[..start].chars().next_back();
+    let after = haystack[end..].chars().next();
+    !before.is_some_and(search_word_char) && !after.is_some_and(search_word_char)
+}
+
+fn content_hit_context(line: &str, ranges: &[(usize, usize)]) -> (String, Vec<(usize, usize)>) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let start = line.len() - line.trim_start().len();
+    let end = start + trimmed.len();
+    let ranges = ranges
+        .iter()
+        .filter_map(|&(match_start, match_end)| {
+            if match_start >= end || match_end <= start {
+                return None;
+            }
+            let match_start = match_start.max(start);
+            let match_end = match_end.min(end);
+            Some((match_start - start, match_end - start))
+        })
+        .collect();
+    (trimmed.replace('\t', " "), ranges)
+}
+
+fn search_word_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
 
 fn collect_quick_files(root: &Path, show_hidden: bool, limit: usize) -> (Vec<QuickFile>, bool) {
     let mut files = Vec::new();
@@ -3105,5 +4635,234 @@ mod tests {
             vec![".gitignore", ".secret", "src/main.rs"]
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn content_search_groups_ignored_and_hidden_rules_with_source_lines() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-sidebar-content-search-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "first\nNeedle here\nneedle again\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".secret"), "needle\n").unwrap();
+        std::fs::write(root.join("target/generated.rs"), "needle\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+
+        let (visible, truncated) =
+            collect_content_hits(&root, false, "NEEDLE", "", "", SearchOptions::default(), 20)
+                .unwrap();
+        assert!(!truncated);
+        assert_eq!(
+            visible
+                .iter()
+                .map(|hit| (hit.label.as_str(), hit.line))
+                .collect::<Vec<_>>(),
+            vec![("src/main.rs", 2), ("src/main.rs", 3)]
+        );
+        let (with_hidden, _) =
+            collect_content_hits(&root, true, "needle", "", "", SearchOptions::default(), 20)
+                .unwrap();
+        assert_eq!(with_hidden.len(), 3);
+        assert!(with_hidden.iter().any(|hit| hit.label == ".secret"));
+
+        let (included, _) = collect_content_hits(
+            &root,
+            true,
+            "needle",
+            "src/**",
+            "",
+            SearchOptions::default(),
+            20,
+        )
+        .unwrap();
+        assert_eq!(included.len(), 2);
+        let (excluded, _) = collect_content_hits(
+            &root,
+            true,
+            "needle",
+            "",
+            "src/**",
+            SearchOptions::default(),
+            20,
+        )
+        .unwrap();
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].label, ".secret");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn content_search_options_match_vscode_semantics() {
+        assert!(content_line_matches(
+            "Needle needlebox",
+            "needle",
+            SearchOptions::default(),
+            None,
+        ));
+        assert!(!content_line_matches(
+            "Needle",
+            "needle",
+            SearchOptions {
+                match_case: true,
+                ..SearchOptions::default()
+            },
+            None,
+        ));
+        assert!(content_line_matches(
+            "a needle here",
+            "needle",
+            SearchOptions {
+                whole_word: true,
+                ..SearchOptions::default()
+            },
+            None,
+        ));
+        assert!(!content_line_matches(
+            "needlebox",
+            "needle",
+            SearchOptions {
+                whole_word: true,
+                ..SearchOptions::default()
+            },
+            None,
+        ));
+
+        let regex = RegexBuilder::new(r"need(le|ful)")
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        assert!(content_line_matches(
+            "NEEDFUL",
+            "ignored",
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+            Some(&regex),
+        ));
+        assert!(build_search_globs("[", "include").is_err());
+        let directories = build_search_globs("node_modules", "exclude")
+            .unwrap()
+            .unwrap();
+        assert!(directories.is_match("web/node_modules/pkg/index.js"));
+        assert!(directories.is_match("node_modules/pkg/index.js"));
+    }
+
+    #[test]
+    fn focused_empty_search_hides_its_placeholder() {
+        let focused = search_input_line("", "Search", true, 20);
+        assert_eq!(
+            focused
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "█"
+        );
+        let idle = search_input_line("", "Search", false, 20);
+        assert_eq!(idle.spans[0].content.as_ref(), "Search");
+        assert!(idle.spans[0].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn search_result_context_bolds_every_visible_match() {
+        let line = "Needle plus needlebox";
+        let ranges = content_line_match_ranges(line, "needle", SearchOptions::default(), None);
+        let spans = highlighted_search_context(line, &ranges, 80, Style::default().bold());
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "Needle plus needlebox"
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::BOLD))
+                .count(),
+            2
+        );
+
+        let line = "needle plus needlebox";
+        let ranges = content_line_match_ranges(
+            line,
+            "needle",
+            SearchOptions {
+                whole_word: true,
+                ..SearchOptions::default()
+            },
+            None,
+        );
+        let spans = highlighted_search_context(line, &ranges, 80, Style::default().bold());
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::BOLD))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_highlights_follow_literal_boundaries_unicode_and_clipping() {
+        let whole_word = SearchOptions {
+            whole_word: true,
+            ..SearchOptions::default()
+        };
+        let punctuation = "use C++ here";
+        let ranges = content_line_match_ranges(punctuation, "C++", whole_word, None);
+        assert_eq!(ranges, [(4, 7)]);
+
+        let unicode = "İ and s ſ";
+        assert_eq!(
+            content_line_match_ranges(unicode, "i", SearchOptions::default(), None),
+            [(0, 2)]
+        );
+        assert_eq!(
+            content_line_match_ranges(unicode, "s", SearchOptions::default(), None),
+            [(7, 8)]
+        );
+        assert_eq!(
+            content_line_match_ranges("ΟΣ", "ΟΣ", SearchOptions::default(), None),
+            [(0, 4)]
+        );
+
+        let (_, trimmed_ranges) = content_hit_context(" needle", &[(0, 1)]);
+        assert!(trimmed_ranges.is_empty());
+
+        let clipped = "needlebox needle";
+        let ranges = content_line_match_ranges(clipped, "needle", whole_word, None);
+        let spans = highlighted_search_context(clipped, &ranges, 8, Style::default().bold());
+        assert!(
+            spans
+                .iter()
+                .all(|span| !span.style.add_modifier.contains(Modifier::BOLD))
+        );
+
+        let ranges = content_line_match_ranges("needle", "needle", whole_word, None);
+        let spans = highlighted_search_context("needle", &ranges, 5, Style::default().bold());
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "need…"
+        );
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn search_toolbar_uses_full_size_codicons_in_material_mode() {
+        assert_eq!(
+            search_toolbar_icons(IconTheme::Material),
+            ("\u{eb37}", "\u{eabf}", "\u{ea7c}")
+        );
     }
 }

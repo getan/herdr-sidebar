@@ -68,6 +68,12 @@ pub enum Exit {
     Quit,
     /// The user picked the other view — main re-renders in process.
     Switch,
+    /// Switch to the Search view. `focus_query` puts the caret in the search
+    /// box (the Ctrl+F "find" gesture); a plain view switch passes false so the
+    /// box isn't focused and 1/2/3 keep switching.
+    Search {
+        focus_query: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -230,6 +236,9 @@ impl PreviewPlacement {
 pub struct State {
     pub merged: bool,
     pub active: View,
+    /// Restore the Search activity rather than the Explorer tree when the
+    /// unified sidebar is reopened. Search shares the Explorer process.
+    pub search_active: bool,
     /// Show the hotkey chips at the bottom of the sidebar (they always
     /// live in the ⚙ Settings modal; the footer copy is opt-in).
     pub show_hotkeys: bool,
@@ -287,6 +296,7 @@ impl Default for State {
         Self {
             merged: true,
             active: View::Explorer,
+            search_active: false,
             show_hotkeys: false,
             icons: None,
             color_theme: ColorTheme::VsCode,
@@ -441,9 +451,10 @@ fn write_state(path: &Path, state: State) {
     };
     let editor_json = serde_json::to_string(&state.editor_cmd).unwrap_or_default();
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"collapsed\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"editor_cmd\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"collapsed\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"editor_cmd\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
+        state.search_active,
         state.show_hotkeys,
         state.font_prompt_done,
         state.auto_open,
@@ -840,6 +851,10 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| v.as_str())
             .and_then(View::from_state_name)
             .unwrap_or(default.active),
+        search_active: value
+            .get("search_active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.search_active),
         show_hotkeys: value
             .get("hotkeys")
             .and_then(|v| v.as_bool())
@@ -1029,6 +1044,7 @@ mod tests {
         let state = State {
             merged: true,
             active: View::SourceControl,
+            search_active: true,
             show_hotkeys: true,
             icons: Some(crate::icons::IconTheme::Emoji),
             color_theme: ColorTheme::Terminal,
@@ -1044,7 +1060,7 @@ mod tests {
             preview_placement: PreviewPlacement::Pane,
             editor_cmd: "nvim".to_string(),
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"collapsed\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"editor_cmd\":\"nvim\",\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"collapsed\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"editor_cmd\":\"nvim\",\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git

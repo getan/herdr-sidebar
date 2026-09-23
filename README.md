@@ -75,6 +75,10 @@ A real tree, not a directory dump:
   `↑`/`↓` to choose a fuzzy match, and press Enter to open it through the same reusable
   preview flow. The index follows the Explorer's dotfile setting, honors git ignore rules,
   and always skips `.git`.
+- **Search file contents with `Ctrl+F`** — project-wide text search in its own activity
+  view (`1`/`2`/`3` switch Explorer / Source Control / Search). Live results grouped by
+  file with match highlighting; match-case, whole-word and regex toggles plus
+  include/exclude globs; Enter opens the preview at the matching line.
 - **Experimental in-pane editing** — press `e` in a regular UTF-8 file preview. The editor
   has a visible cursor, word-aware wrapping, wrapped-row scrolling, click/drag selection, find, and
   best-effort system clipboard integration. Saving is always explicit; unsaved exits and
@@ -208,8 +212,8 @@ CaskaydiaCove). Also recommended: the
 | `m` | context menu | `o` | open diff |
 | `b` | hide sidebar | `m` | context menu |
 | `s` | settings | `b` | hide sidebar |
-| `1` / `2` | switch view | `s` | settings |
-| | | `1` / `2` | switch view |
+| `1` / `2` / `3` | switch view | `s` | settings |
+| `Ctrl+F` | search contents | `1` / `2` / `3` | switch view |
 
 In a preview tab: drag to select rendered text, `Ctrl/Cmd+C` copy, `↑↓` scroll,
 `⇞⇟` page, `g`/`G` ends, `w` toggle line wrapping, `q` close the tab.
